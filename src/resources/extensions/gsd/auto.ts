@@ -1855,15 +1855,24 @@ export async function startAuto(
           // fallback only for unmigrated/offline projects.
           const mDir = resolveMilestonePath(base, meta.milestoneId);
           let summaryIsTerminal = false;
-          let dbAvailable = isDbAvailable();
+          // M002/S02 fix: open the project's DB BEFORE the first getMilestone()
+          // read. Previously this checked isDbAvailable() first and only opened
+          // on a null row, which silently returned the wrong project's row when
+          // currentDb was a stale handle from a prior project (`getMilestone`
+          // reads from module-global currentDb in gsd-db.ts; a wrong row is
+          // truthy, so the !milestoneRow retry guard never fires).
+          //
+          // Same-file cousin audit (D003): two other getMilestone callers in
+          // this file were checked and intentionally left unchanged:
+          //   - auto.ts:~1095  inside stopAuto() finalization, gated on
+          //     isDbAvailable(). Late-lifecycle, post-dispatch — by then the
+          //     active DB is already this project's. No wrong-project window.
+          //   - auto.ts:~2254  inside ensurePreconditions(), mid-loop. The
+          //     active DB is already this project's at every reachable call
+          //     site. No wrong-project window.
+          const opened = await ensureDbOpen(base);
+          let dbAvailable = opened || isDbAvailable();
           let milestoneRow = dbAvailable ? getMilestone(meta.milestoneId) : null;
-          if (!milestoneRow) {
-            const opened = await ensureDbOpen(base);
-            dbAvailable = opened || isDbAvailable();
-            if (dbAvailable) {
-              milestoneRow = getMilestone(meta.milestoneId);
-            }
-          }
           if (dbAvailable) {
             summaryIsTerminal = !!milestoneRow && isClosedStatus(milestoneRow.status);
           } else {
