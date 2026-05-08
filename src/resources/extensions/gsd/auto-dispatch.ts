@@ -31,7 +31,8 @@ import {
 } from "./paths.js";
 import { parseRoadmap } from "./parsers-legacy.js";
 import { validateArtifact } from "./schemas/validate.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync } from "node:fs";
+import { atomicWriteSync, atomicWriteSyncWithOps, type AtomicWriteSyncOps } from "./atomic-write.js";
 import { logWarning, logError } from "./workflow-logger.js";
 import { join } from "node:path";
 import { hasImplementationArtifacts } from "./auto-recovery.js";
@@ -72,6 +73,7 @@ import { MILESTONE_ID_RE } from "./milestone-ids.js";
 import {
   PROJECT_RESEARCH_INFLIGHT_MARKER,
 } from "./project-research-policy.js";
+import { PROJECT_RESEARCH_HARD_TIMEOUT_MINUTES } from "./auto-timers.js";
 import {
   isWorkflowPrefsCaptured,
   resolveDeepProjectSetupState,
@@ -142,6 +144,47 @@ export function setResearchProjectPromptBuilderForTest(builder: ResearchProjectP
   return () => {
     researchProjectPromptBuilder = previous;
   };
+}
+
+// ─── In-flight marker stale recovery (M002/S01/T04) ───────────────────────
+// The research-project in-flight marker is meaningful only while the
+// research-project unit is actually executing (bounded by the project-
+// research hard timeout in auto-timers.ts). A marker older than 2× the
+// hard timeout is the signature of a crashed prior run (e.g. SIGTERM
+// mid-prompt-build before the try/finally landed) and is safe to reclaim.
+// 2× rather than 1× to leave generous quorum room for legitimately slow
+// runs and coarse filesystem mtime resolution.
+const STALE_INFLIGHT_MARKER_MS = PROJECT_RESEARCH_HARD_TIMEOUT_MINUTES * 60_000 * 2;
+
+let nowFn: () => number = () => Date.now();
+
+/**
+ * Test seam: override the clock used by stale-marker recovery so a test
+ * can simulate the marker being older than the quorum window without
+ * sleeping. Returns a restore function.
+ */
+export function setNowFnForTest(fn: () => number): () => void {
+  const previous = nowFn;
+  nowFn = fn;
+  return () => {
+    nowFn = previous;
+  };
+}
+
+/**
+ * True when the in-flight marker's mtime is older than the stale window.
+ * Defensive fallbacks: if the file disappeared between exists-check and
+ * stat, or stat throws, treat the marker as live (return false) — the
+ * write-with-wx that follows will catch any race.
+ */
+function isInflightMarkerStale(markerPath: string): boolean {
+  try {
+    const stats = statSync(markerPath);
+    const ageMs = nowFn() - stats.mtimeMs;
+    return ageMs > STALE_INFLIGHT_MARKER_MS;
+  } catch {
+    return false;
+  }
 }
 
 export interface DispatchRule {
@@ -279,9 +322,34 @@ export function getRewriteCount(basePath: string): number {
 }
 
 export function setRewriteCount(basePath: string, count: number): void {
+  setRewriteCountWithOps(basePath, count);
+}
+
+/**
+ * Internal seam-injectable variant of {@link setRewriteCount}. Callers in
+ * production should use {@link setRewriteCount}; the optional
+ * {@link AtomicWriteSyncOps} exists to let tests force ENOSPC / SIGKILL-style
+ * failures at the rename boundary without touching real disk.
+ *
+ * Atomic write: temp + rename. Prevents partial/corrupt counter files when a
+ * SIGKILL, ENOSPC, or EBUSY interrupts the write — a partial counter would
+ * either reset the circuit breaker (data loss) or wedge it (livelock). See
+ * M002/S01/T03 (#3624 sibling failure-mode for run-uat counter).
+ *
+ * @internal
+ */
+export function setRewriteCountWithOps(
+  basePath: string,
+  count: number,
+  ops?: AtomicWriteSyncOps,
+): void {
   const filePath = rewriteCountPath(basePath);
-  mkdirSync(join(gsdRoot(basePath), "runtime"), { recursive: true });
-  writeFileSync(filePath, JSON.stringify({ count, updatedAt: new Date().toISOString() }) + "\n");
+  const payload = JSON.stringify({ count, updatedAt: new Date().toISOString() }) + "\n";
+  if (ops) {
+    atomicWriteSyncWithOps(filePath, payload, "utf-8", ops);
+  } else {
+    atomicWriteSync(filePath, payload, "utf-8");
+  }
 }
 
 // ─── Run-UAT dispatch counter (per-slice) ────────────────────────────────
@@ -303,10 +371,31 @@ export function getUatCount(basePath: string, mid: string, sid: string): number 
 }
 
 export function incrementUatCount(basePath: string, mid: string, sid: string): number {
+  return incrementUatCountWithOps(basePath, mid, sid);
+}
+
+/**
+ * Internal seam-injectable variant of {@link incrementUatCount}. See
+ * {@link setRewriteCountWithOps} for the rationale.
+ *
+ * @internal
+ */
+export function incrementUatCountWithOps(
+  basePath: string,
+  mid: string,
+  sid: string,
+  ops?: AtomicWriteSyncOps,
+): number {
   const count = getUatCount(basePath, mid, sid) + 1;
   const filePath = uatCountPath(basePath, mid, sid);
-  mkdirSync(join(gsdRoot(basePath), "runtime"), { recursive: true });
-  writeFileSync(filePath, JSON.stringify({ count, updatedAt: new Date().toISOString() }) + "\n");
+  const payload = JSON.stringify({ count, updatedAt: new Date().toISOString() }) + "\n";
+  // Atomic write: temp + rename. See setRewriteCountWithOps above — the run-uat
+  // counter (#3624) shares the same partial-write failure mode and the same fix.
+  if (ops) {
+    atomicWriteSyncWithOps(filePath, payload, "utf-8", ops);
+  } else {
+    atomicWriteSync(filePath, payload, "utf-8");
+  }
   return count;
 }
 
@@ -667,7 +756,33 @@ export const DISPATCH_RULES: DispatchRule[] = [
           "Project research is already in progress. Wait for it to finish, or clear `.gsd/runtime/research-project-inflight` if the prior run crashed.",
         level: "info" as const,
       };
-      if (existsSync(inflightMarkerPath)) return researchInFlightStop;
+      // Stale-marker recovery (M002/S01/T04): a SIGTERM mid-prompt-build
+      // before T04's try/finally landed could strand the marker forever.
+      // The marker is meaningful only while a research-project unit is
+      // actually executing — bounded by the project-research hard timeout.
+      // Use 2× hard timeout as the stale window so a slow but live marker
+      // is never reclaimed mid-flight; a marker older than that is the
+      // signature of a crashed prior run, not a healthy in-flight one.
+      if (existsSync(inflightMarkerPath)) {
+        if (isInflightMarkerStale(inflightMarkerPath)) {
+          try {
+            unlinkSync(inflightMarkerPath);
+            logWarning(
+              "dispatch",
+              "stale in-flight marker reclaimed",
+              { id: "research-project-inflight" },
+            );
+          } catch (reclaimErr) {
+            logWarning(
+              "dispatch",
+              `failed to reclaim stale research-project in-flight marker: ${reclaimErr instanceof Error ? reclaimErr.message : String(reclaimErr)}`,
+            );
+            return researchInFlightStop;
+          }
+        } else {
+          return researchInFlightStop;
+        }
+      }
       mkdirSync(runtimeDir, { recursive: true });
       try {
         writeFileSync(
@@ -681,24 +796,33 @@ export const DISPATCH_RULES: DispatchRule[] = [
         }
         throw err;
       }
+      // try/finally invariant (M002/S01/T04, fixes D004 strand): the
+      // marker is unlinked on every throw path out of the prompt-build
+      // block — including SIGTERM-driven async rejections that the prior
+      // try/catch would have skipped. The dispatched flag is what keeps
+      // a successful dispatch from clearing the marker (only the
+      // downstream guided-research-project closeout may clear it then).
+      let dispatched = false;
       try {
         const prompt = await researchProjectPromptBuilder(basePath, structuredQuestionsAvailable);
+        dispatched = true;
         return {
           action: "dispatch",
           unitType: "research-project",
           unitId: "RESEARCH-PROJECT",
           prompt,
         };
-      } catch (err) {
-        try {
-          if (existsSync(inflightMarkerPath)) unlinkSync(inflightMarkerPath);
-        } catch (cleanupErr) {
-          logWarning(
-            "dispatch",
-            `failed to remove research-project in-flight marker after prompt assembly error: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
-          );
+      } finally {
+        if (!dispatched) {
+          try {
+            if (existsSync(inflightMarkerPath)) unlinkSync(inflightMarkerPath);
+          } catch (cleanupErr) {
+            logWarning(
+              "dispatch",
+              `failed to remove research-project in-flight marker after prompt assembly error: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
+            );
+          }
         }
-        throw err;
       }
     },
   },
