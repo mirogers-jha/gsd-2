@@ -82,7 +82,17 @@ test("#2007 bug 1: MAX_ARTIFACT_VERIFICATION_RETRIES constant is defined", () =>
 });
 
 test("#2007 bug 1: attempt is compared against MAX_ARTIFACT_VERIFICATION_RETRIES before returning retry", () => {
-  const retryBlockIdx = postUnitPreVerificationBody.indexOf("const retryKey =");
+  // After M002/S01/T05 the retry block reads attempt via `readRetryCounter`
+  // instead of `const retryKey = ...; verificationRetryCount.get(retryKey)`.
+  // Anchor on the readRetryCounter call site (or the older retryKey form for
+  // backward compatibility with diff-based reviewers).
+  const retryBlockIdx = (() => {
+    const a = postUnitPreVerificationBody.indexOf("readRetryCounter(");
+    const b = postUnitPreVerificationBody.indexOf("const retryKey =");
+    if (a === -1) return b;
+    if (b === -1) return a;
+    return Math.min(a, b);
+  })();
   assert.ok(retryBlockIdx !== -1, "retry block must exist in postUnitPreVerification");
 
   const retryIdx = postUnitPreVerificationBody.indexOf("return \"retry\"", retryBlockIdx);
@@ -215,13 +225,20 @@ test("#2007 verificationRetryCount is cleared on artifact verification success",
     successClearIdx !== -1,
     "Must guard the retry-count clear behind a triggerArtifactVerified check",
   );
-  const deleteIdx = postUnitPreVerificationBody.indexOf(
+  // After M002/S01/T05 the clear flows through `clearRetryCounter(...)` rather
+  // than calling `verificationRetryCount.delete` directly. Accept either form
+  // so the structural test stays stable across the migration window.
+  const directDeleteIdx = postUnitPreVerificationBody.indexOf(
     "verificationRetryCount.delete",
     successClearIdx,
   );
+  const helperClearIdx = postUnitPreVerificationBody.indexOf(
+    "clearRetryCounter(s.verificationRetryCount",
+    successClearIdx,
+  );
   assert.ok(
-    deleteIdx !== -1,
-    "verificationRetryCount.delete must be called on the verification-success path",
+    directDeleteIdx !== -1 || helperClearIdx !== -1,
+    "verificationRetryCount must be cleared (via .delete or clearRetryCounter helper) on the verification-success path",
   );
 });
 

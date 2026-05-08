@@ -14,6 +14,21 @@
 import type { ExtensionContext, ExtensionAPI } from "@gsd/pi-coding-agent";
 import { deriveState } from "./state.js";
 import { logWarning, logError } from "./workflow-logger.js";
+import {
+  buildRetryCounterKey,
+  clearRetryCounter,
+  readRetryCounter,
+  type RetryCounterMigrationEvent,
+} from "./auto/retry-counter-key.js";
+
+/** Surface a one-line info-class log when a legacy retry-counter key is migrated forward. */
+function logPostUnitRetryCounterMigration(event: RetryCounterMigrationEvent): void {
+  logWarning("auto-retry-counter", "legacy key migrated", {
+    legacyKey: event.legacyKey,
+    canonicalKey: event.canonicalKey,
+    value: String(event.value),
+  });
+}
 import { loadFile, parseSummary, resolveAllOverrides } from "./files.js";
 import { loadPrompt } from "./prompt-loader.js";
 import { isAwaitingUserInput } from "./user-input-boundary.js";
@@ -969,13 +984,12 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       }
 
       if (!triggerArtifactVerified && s.currentUnit.type === "research-project") {
-        const retryKey = `${s.currentUnit.type}:${s.currentUnit.id}`;
         const outcome = finalizeProjectResearchTimeout(
           s.basePath,
           "Project research unit ended before all required dimensions produced durable files.",
         );
         s.pendingVerificationRetry = null;
-        s.verificationRetryCount.delete(retryKey);
+        clearRetryCounter(s.verificationRetryCount, "verify", s.currentUnit.id);
         triggerArtifactVerified = verifyExpectedArtifact(s.currentUnit.type, s.currentUnit.id, s.basePath);
         if (triggerArtifactVerified) {
           invalidateAllCaches();
@@ -1028,12 +1042,11 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
         await pauseAuto(ctx, pi);
         return "dispatched";
       } else if (!triggerArtifactVerified && s.lastToolInvocationError && isDeterministicPolicyError(s.lastToolInvocationError)) {
-        const retryKey = `${s.currentUnit.type}:${s.currentUnit.id}`;
         debugLog("postUnit", { phase: "deterministic-policy-error-placeholder", unitType: s.currentUnit.type, unitId: s.currentUnit.id, error: s.lastToolInvocationError });
         const reason = `Deterministic policy rejection for ${s.currentUnit.type} "${s.currentUnit.id}": ${s.lastToolInvocationError}. Retrying cannot resolve this gate — writing blocker placeholder to advance pipeline.`;
         s.lastToolInvocationError = null;
         s.pendingVerificationRetry = null;
-        s.verificationRetryCount.delete(retryKey);
+        clearRetryCounter(s.verificationRetryCount, "verify", s.currentUnit.id);
         writeBlockerPlaceholder(s.currentUnit.type, s.currentUnit.id, s.basePath, reason);
         ctx.ui.notify(
           `${s.currentUnit.type} ${s.currentUnit.id} — deterministic policy rejection, wrote blocker placeholder (no retries) (#4973)`,
@@ -1062,15 +1075,19 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
 
         const hasExpectedArtifact = resolveExpectedArtifactPath(s.currentUnit.type, s.currentUnit.id, s.basePath) !== null;
         if (hasExpectedArtifact) {
-          const retryKey = `${s.currentUnit.type}:${s.currentUnit.id}`;
-          const attempt = (s.verificationRetryCount.get(retryKey) ?? 0) + 1;
+          const attempt = readRetryCounter(
+            s.verificationRetryCount,
+            "verify",
+            s.currentUnit.id,
+            logPostUnitRetryCounterMigration,
+          ) + 1;
           const failureDetails = describeArtifactVerificationFailure(
             s.currentUnit.type,
             s.currentUnit.id,
             s.basePath,
           );
           if (attempt > MAX_ARTIFACT_VERIFICATION_RETRIES) {
-            s.verificationRetryCount.delete(retryKey);
+            clearRetryCounter(s.verificationRetryCount, "verify", s.currentUnit.id);
             debugLog("postUnit", { phase: "artifact-verify-exhausted", unitType: s.currentUnit.type, unitId: s.currentUnit.id, attempt });
             ctx.ui.notify(
               `${failureDetails} Pausing auto-mode after ${MAX_ARTIFACT_VERIFICATION_RETRIES} retries.`,
@@ -1079,7 +1096,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
             await pauseAuto(ctx, pi);
             return "dispatched";
           }
-          s.verificationRetryCount.set(retryKey, attempt);
+          s.verificationRetryCount.set(buildRetryCounterKey("verify", s.currentUnit.id), attempt);
           s.pendingVerificationRetry = {
             unitId: s.currentUnit.id,
             failureContext: `${failureDetails} (attempt ${attempt}/${MAX_ARTIFACT_VERIFICATION_RETRIES}).`,
@@ -1097,7 +1114,7 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
       // Verification succeeded — clear the retry counter so a future failure
       // of the same unit gets a full retry budget instead of the stale count.
       if (triggerArtifactVerified) {
-        s.verificationRetryCount.delete(`${s.currentUnit.type}:${s.currentUnit.id}`);
+        clearRetryCounter(s.verificationRetryCount, "verify", s.currentUnit.id);
       }
     } else {
       // Hook unit completed — no additional processing needed

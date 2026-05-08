@@ -119,3 +119,129 @@ export function parseRetryCounterKey(raw: string): ParsedRetryCounterKey | null 
 function isUnitIdShape(id: string): boolean {
   return /^M\d{3}(?:-[a-z0-9]{6})?(?:\/S\d{2}(?:\/T\d{2})?)?$/.test(id);
 }
+
+// ─── Map-aware read/clear helpers (T05 migration window) ───────────────────
+//
+// Read sites must accept canonical, legacy bare-id, and legacy `${type}/${id}`
+// formats during the one-milestone deprecation window. The helpers below take
+// the in-memory `verificationRetryCount` Map and a (type, id) tuple, look up
+// the value under all known formats, and (when reading) migrate any legacy
+// hit to canonical so subsequent reads/writes converge.
+//
+// `onLegacyMigrated` lets call sites surface a `logWarning` without coupling
+// this module to `workflow-logger.ts` — keeps the helper pure/testable.
+
+export interface RetryCounterMigrationEvent {
+  /** Legacy key that was found in the map. */
+  legacyKey: string;
+  /** Canonical key the value was migrated to. */
+  canonicalKey: string;
+  /** Counter value preserved across the migration. */
+  value: number;
+}
+
+/**
+ * Resolve the value of a retry counter, accepting legacy keys.
+ *
+ * Lookup order (first hit wins):
+ *   1. canonical `${type}:${id}`
+ *   2. legacy `${type}/${id}` (slash variant, used by workflow-custom-engine)
+ *   3. legacy bare `${id}` (only when type === "verify"; bare keys had no phase)
+ *
+ * On legacy hit the value is migrated to the canonical slot and the legacy
+ * entry is deleted, so subsequent operations converge. Returns 0 when no
+ * key is present.
+ */
+export function readRetryCounter(
+  map: Map<string, number>,
+  type: RetryCounterType,
+  id: string,
+  onLegacyMigrated?: (event: RetryCounterMigrationEvent) => void,
+): number {
+  const canonical = buildRetryCounterKey(type, id);
+
+  // Collect every key in the map that refers to the same (type, id) tuple
+  // under any known schema, then merge them all into the canonical slot. We
+  // use Math.max as the merge function because retry counters are monotonic
+  // attempt counts — taking the largest preserves the worst-case circuit
+  // breaker state, which is the safer-for-correctness choice (sum would
+  // double-count; min would forget retries already burned).
+  let merged: number | undefined = undefined;
+  if (typeof map.get(canonical) === "number") {
+    merged = map.get(canonical);
+  }
+
+  // Phase-keyed legacy: `${type}/${id}` (slash variant) and bare `${id}` for verify.
+  const phaseLegacyKeys: string[] = [`${type}/${id}`];
+  if (type === "verify") {
+    phaseLegacyKeys.push(id);
+  }
+  for (const legacyKey of phaseLegacyKeys) {
+    const value = map.get(legacyKey);
+    if (typeof value !== "number") continue;
+    merged = merged === undefined ? value : Math.max(merged, value);
+    map.delete(legacyKey);
+    onLegacyMigrated?.({ legacyKey, canonicalKey: canonical, value });
+  }
+
+  // Pre-T05 schemas where the head is an auto-mode UNIT TYPE
+  // (research-project, execute-task, complete-milestone, ...) — separator was
+  // either ":" (auto-post-unit) or "/" (workflow-custom-engine). Only swept
+  // for `type === "verify"` because uat/rewrite never used unit-type heads.
+  if (type === "verify") {
+    for (const existingKey of Array.from(map.keys())) {
+      if (existingKey === canonical) continue;
+      const c = existingKey.indexOf(":");
+      const sl = existingKey.indexOf("/");
+      const sepIdx = c < 0 ? sl : sl < 0 ? c : Math.min(c, sl);
+      if (sepIdx <= 0) continue;
+      const head = existingKey.slice(0, sepIdx);
+      const tail = existingKey.slice(sepIdx + 1);
+      if (tail !== id) continue;
+      if (RETRY_COUNTER_TYPES.has(head)) continue; // phase-keyed — already considered above
+      const value = map.get(existingKey);
+      if (typeof value !== "number") continue;
+      merged = merged === undefined ? value : Math.max(merged, value);
+      map.delete(existingKey);
+      onLegacyMigrated?.({ legacyKey: existingKey, canonicalKey: canonical, value });
+    }
+  }
+
+  if (merged === undefined) {
+    return 0;
+  }
+  // Materialize the canonical slot exactly once — even when the value came
+  // straight from an existing canonical entry — so callers get a stable shape.
+  map.set(canonical, merged);
+  return merged;
+}
+
+/**
+ * Delete a retry counter under the canonical key AND any legacy key variants.
+ * Used by the many "clear retries on success" sites that previously deleted
+ * only one schema and so left orphaned counters under the other.
+ */
+export function clearRetryCounter(
+  map: Map<string, number>,
+  type: RetryCounterType,
+  id: string,
+): void {
+  map.delete(buildRetryCounterKey(type, id));
+  map.delete(`${type}/${id}`);
+  if (type === "verify") {
+    map.delete(id);
+    // Also drop pre-T05 `${unitType}<sep>${id}` entries that share the same id
+    // (sep ∈ ":" | "/"). See `readRetryCounter` for the migration rationale.
+    for (const existingKey of Array.from(map.keys())) {
+      const c = existingKey.indexOf(":");
+      const sl = existingKey.indexOf("/");
+      const sepIdx = c < 0 ? sl : sl < 0 ? c : Math.min(c, sl);
+      if (sepIdx <= 0) continue;
+      const head = existingKey.slice(0, sepIdx);
+      const tail = existingKey.slice(sepIdx + 1);
+      if (tail === id && !RETRY_COUNTER_TYPES.has(head)) {
+        map.delete(existingKey);
+      }
+    }
+  }
+}

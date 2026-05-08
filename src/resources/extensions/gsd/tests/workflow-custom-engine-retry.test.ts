@@ -20,6 +20,8 @@ function makeHarness(options?: {
 } {
   const retryCounts = new Map<string, number>();
   if (options?.initialAttempts !== undefined) {
+    // Seed under the legacy `${unitType}/${unitId}` schema so the test also
+    // exercises the T05 read-side migration to the canonical `verify:${id}`.
     retryCounts.set("execute-task/T01", options.initialAttempts);
   }
   const session = { verificationRetryCount: retryCounts };
@@ -54,7 +56,9 @@ test("handleCustomEngineVerifyRetry increments and persists retry attempts", asy
   });
 
   assert.deepEqual(outcome, { action: "retry", attempts: 1 });
-  assert.equal(session.verificationRetryCount.get("execute-task/T01"), 1);
+  // T05: writes now land under canonical `verify:${id}`, not the legacy slash key.
+  assert.equal(session.verificationRetryCount.get("verify:T01"), 1);
+  assert.equal(session.verificationRetryCount.get("execute-task/T01"), undefined);
   assert.deepEqual(calls, [
     ["hydrate"],
     ["save"],

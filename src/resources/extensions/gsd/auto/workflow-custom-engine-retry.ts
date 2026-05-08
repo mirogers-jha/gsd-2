@@ -6,6 +6,11 @@ import {
   decideCustomEngineRecovery,
   decideCustomEngineVerifyRetry,
 } from "./workflow-kernel.js";
+import {
+  buildRetryCounterKey,
+  readRetryCounter,
+  type RetryCounterMigrationEvent,
+} from "./retry-counter-key.js";
 
 type RetrySession = Pick<AutoSession, "verificationRetryCount">;
 
@@ -29,6 +34,8 @@ export interface HandleCustomEngineVerifyRetryDeps {
   ) => Promise<CustomEngineRecoverResult>;
   logRetry: (details: { iteration: number; unitId: string; attempts: number }) => void;
   reportRetry: (details: { unitType: string; unitId: string; attempts: number }) => void;
+  /** Optional sink for legacy-key migration events; defaults to no-op for tests. */
+  onLegacyMigrated?: (event: RetryCounterMigrationEvent) => void;
 }
 
 export async function handleCustomEngineVerifyRetry(input: {
@@ -40,10 +47,20 @@ export async function handleCustomEngineVerifyRetry(input: {
   maxRetries: number;
   deps: HandleCustomEngineVerifyRetryDeps;
 }): Promise<CustomEngineVerifyRetryOutcome> {
-  const recoveryKey = `${input.unitType}/${input.unitId}`;
   const retryCounts = input.deps.hydrateRetryCounts();
-  const attempts = (retryCounts.get(recoveryKey) ?? 0) + 1;
-  input.session.verificationRetryCount.set(recoveryKey, attempts);
+  // Read accepts canonical `verify:${id}`, legacy `${type}/${id}`, and the
+  // pre-T05 bare-id schema. On legacy hit the value is migrated forward so
+  // the in-memory map and the persisted JSON converge.
+  const attempts = readRetryCounter(
+    retryCounts,
+    "verify",
+    input.unitId,
+    input.deps.onLegacyMigrated,
+  ) + 1;
+  input.session.verificationRetryCount.set(
+    buildRetryCounterKey("verify", input.unitId),
+    attempts,
+  );
   input.deps.saveRetryCounts();
   input.deps.logRetry({
     iteration: input.iteration,

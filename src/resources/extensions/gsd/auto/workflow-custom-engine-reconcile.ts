@@ -7,6 +7,7 @@ import {
   decideEngineReconcile,
   type EngineReconcileDecision,
 } from "./workflow-kernel.js";
+import { clearRetryCounter } from "./retry-counter-key.js";
 
 export interface CustomEngineReconcileSession {
   currentUnit?: { startedAt: number } | null;
@@ -42,7 +43,11 @@ export async function handleCustomEngineReconcile(input: {
   iteration: number;
   deps: HandleCustomEngineReconcileDeps;
 }): Promise<CustomEngineReconcileOutcome> {
-  input.session.verificationRetryCount?.delete(`${input.iterData.unitType}/${input.iterData.unitId}`);
+  if (input.session.verificationRetryCount) {
+    // Clear canonical + all known legacy schemas so successful reconciliation
+    // does not leave a stranded counter under any pre-T05 key shape.
+    clearRetryCounter(input.session.verificationRetryCount, "verify", input.iterData.unitId);
+  }
   input.deps.saveRetryCounts();
   input.deps.logReconcile({
     iteration: input.iteration,

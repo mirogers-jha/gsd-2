@@ -68,6 +68,7 @@ export type LogComponent =
   | "memory-store"      // Memory CRUD layer — surfaces SQLite/store-level faults (#4967)
   | "context-mode"     // Context-mode exec sandbox and compaction snapshot
   | "preflight"        // Clean-root preflight gate at milestone completion
+  | "auto-retry-counter" // M002/S01: legacy retry-counter key migrations
   | "postUnit";     // Post-unit processing (abandon detection, overrides)
 
 export interface LogEntry {
