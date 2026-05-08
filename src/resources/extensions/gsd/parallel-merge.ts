@@ -7,7 +7,6 @@
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
 import { loadFile } from "./files.js";
 import { resolveGsdPathContract, resolveMilestoneFile } from "./paths.js";
 import { mergeMilestoneToMain } from "./auto-worktree.js";
@@ -15,7 +14,9 @@ import { MergeConflictError } from "./git-service.js";
 import { removeSessionStatus } from "./session-status-io.js";
 import type { WorkerInfo } from "./parallel-orchestrator.js";
 import { getErrorMessage } from "./error-utils.js";
-import { logWarning } from "./workflow-logger.js";
+import { logWarning, logError } from "./workflow-logger.js";
+import { runSqliteCli } from "./parallel-sqlite-cli.js";
+import { InvalidIdError } from "./milestone-ids.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -43,13 +44,14 @@ export function isMilestoneCompleteInProjectDb(basePath: string, mid: string): b
   if (!existsSync(dbPath)) return false;
 
   try {
-    const result = spawnSync(
-      "sqlite3",
-      [dbPath, `SELECT status FROM milestones WHERE id='${mid}' LIMIT 1`],
-      { timeout: 3000, encoding: "utf-8" },
-    );
+    const result = runSqliteCli({
+      dbPath,
+      sql: `SELECT status FROM milestones WHERE id='${mid}' LIMIT 1`,
+      mid,
+    });
     return (result.stdout || "").trim() === "complete";
   } catch (e) {
+    if (e instanceof InvalidIdError) throw e;
     logWarning("parallel", `spawnSync milestone completion check failed for ${mid}: ${(e as Error).message}`);
     return false;
   }
@@ -64,8 +66,21 @@ function discoverDbCompletedMilestones(basePath: string): Set<string> {
   const worktreeDir = join(basePath, ".gsd", "worktrees");
   try {
     for (const entry of readdirSync(worktreeDir)) {
-      if (entry.startsWith("M") && isMilestoneCompleteInProjectDb(basePath, entry)) {
-        completed.add(entry);
+      if (!entry.startsWith("M")) continue;
+      try {
+        if (isMilestoneCompleteInProjectDb(basePath, entry)) {
+          completed.add(entry);
+        }
+      } catch (e) {
+        if (e instanceof InvalidIdError) {
+          logError("parallel", "rejected ID at sqlite3 boundary", {
+            source: "discoverDbCompletedMilestones",
+            attemptedId: e.attemptedId,
+            kind: e.kind,
+          });
+          continue;
+        }
+        throw e;
       }
     }
   } catch (e) {
@@ -73,6 +88,10 @@ function discoverDbCompletedMilestones(basePath: string): Set<string> {
   }
   return completed;
 }
+
+/** Test-only re-export so the malicious-worktree-name behavioural test can call
+ *  the discovery function directly without going through `determineMergeOrder`. */
+export const _discoverDbCompletedMilestonesForTests = discoverDbCompletedMilestones;
 
 /**
  * Determine safe merge order for completed milestones.

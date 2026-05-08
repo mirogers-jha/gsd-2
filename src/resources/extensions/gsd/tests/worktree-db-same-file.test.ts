@@ -128,8 +128,11 @@ describe("#2823: reconcileWorktreeDb same-file guard", () => {
     });
     closeDatabase();
 
-    // Create a separate worktree DB with different data
-    const wtGsd = join(tmpDir, "worktree", ".gsd");
+    // Create a separate worktree DB with different data.
+    // S05/T03: worktree path basename MUST match MILESTONE_ID_RE so
+    // assertGsdDbPath accepts it (production layout is always
+    // `<repo>/.gsd/worktrees/M###/.gsd/gsd.db`).
+    const wtGsd = join(tmpDir, "M001", ".gsd");
     mkdirSync(wtGsd, { recursive: true });
     const worktreeDbPath = join(wtGsd, "gsd.db");
 

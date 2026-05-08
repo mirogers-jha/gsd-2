@@ -122,7 +122,11 @@ describe('worktree-db-integration', async () => {
     console.log("\n=== Test 3: reconcile merges worktree rows into main ===");
     {
       const mainDbPath = join(makeTempDir(), "main.db");
-      const worktreeDbPath = join(makeTempDir(), "wt.db");
+      // S05/T03: assertGsdDbPath requires `<root>/.gsd/gsd.db` where `<root>`
+      // basename matches MILESTONE_ID_RE.
+      const wtRoot = join(makeTempDir(), "M002", ".gsd");
+      mkdirSync(wtRoot, { recursive: true });
+      const worktreeDbPath = join(wtRoot, "gsd.db");
 
       // Seed main DB (empty schema)
       openDatabase(mainDbPath);

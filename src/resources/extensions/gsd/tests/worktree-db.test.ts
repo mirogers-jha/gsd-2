@@ -22,7 +22,14 @@ import {
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 function tempDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "gsd-wt-test-"));
+  // S05/T03: assertGsdDbPath requires `<root>/.gsd/gsd.db` where `<root>`
+  // basename matches MILESTONE_ID_RE. Build a `M001/.gsd` subdirectory under
+  // each fresh tmp so `path.join(tempDir(), "gsd.db")` yields a path that
+  // passes ATTACH-path validation in reconcileWorktreeDb.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gsd-wt-test-"));
+  const dbDir = path.join(root, "M001", ".gsd");
+  fs.mkdirSync(dbDir, { recursive: true });
+  return dbDir;
 }
 
 function seedMainDb(dbPath: string): void {
@@ -312,11 +319,14 @@ test("reconcileWorktreeDb handles missing worktree DB gracefully", (t) => {
 });
 
 test("reconcileWorktreeDb handles paths containing spaces", (t) => {
+  // S05/T03: spaces are still allowed in *parent* directories — only the
+  // worktree-root basename must match MILESTONE_ID_RE. Production paths
+  // like `/Users/Alice Smith/repo/.gsd/worktrees/M001/.gsd/gsd.db` are valid.
   const baseDir = tempDir();
   registerCleanup(t, baseDir);
 
-  const mainDir = path.join(baseDir, "main dir");
-  const wtDir = path.join(baseDir, "worktree dir");
+  const mainDir = path.join(baseDir, "main dir", "M001", ".gsd");
+  const wtDir = path.join(baseDir, "worktree dir", "M001", ".gsd");
   fs.mkdirSync(mainDir, { recursive: true });
   fs.mkdirSync(wtDir, { recursive: true });
 

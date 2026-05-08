@@ -433,6 +433,7 @@ export function applyMigrationV22QualityGateRepair(db: DbAdapter, hooks: Migrati
   const taskIdCol = qgInfo.find((r) => r["name"] === "task_id");
   const needsRepair = taskIdCol && (taskIdCol["notnull"] === 0 || taskIdCol["notnull"] === "0");
   if (needsRepair) {
+    db.exec("DROP TABLE IF EXISTS quality_gates_new");
     db.exec(`
       CREATE TABLE quality_gates_new (
         milestone_id TEXT NOT NULL,

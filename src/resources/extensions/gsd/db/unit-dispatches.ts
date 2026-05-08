@@ -266,7 +266,10 @@ export function markFailed(dispatchId: number, opts: FailureOpts): void {
   if (!isDbAvailable()) return;
   const now = new Date();
   const nowIso = now.toISOString();
-  const nextRunIso = opts.retryAfterMs
+  // Explicit nullish-aware check: `retryAfterMs === 0` (immediate retry)
+  // must NOT be coerced to "no retry" by a truthy ternary. Only treat
+  // undefined/null as the no-retry signal. (D004 / M001 S05 T04.)
+  const nextRunIso = (typeof opts.retryAfterMs === "number")
     ? new Date(now.getTime() + opts.retryAfterMs).toISOString()
     : null;
   const db = _getAdapter()!;

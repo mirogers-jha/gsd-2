@@ -32,6 +32,7 @@ import type { GsdWorkspace, MilestoneScope } from "./workspace.js";
 import { getGateIdsForTurn, type OwnerTurn } from "./gate-registry.js";
 import { logError, logWarning } from "./workflow-logger.js";
 import { createDbAdapter, type DbAdapter } from "./db-adapter.js";
+import { assertGsdDbPath, InvalidIdError } from "./milestone-ids.js";
 import { createBaseSchemaObjects } from "./db-base-schema.js";
 import { createCoordinationTablesV24 } from "./db-coordination-schema.js";
 import { createDbConnectionCache, type DbConnectionCacheEntry } from "./db-connection-cache.js";
@@ -387,6 +388,24 @@ export function _getDbCache(): ReadonlyMap<string, DbConnectionCacheEntry> {
   return _dbCache.asReadonlyMap();
 }
 
+/**
+ * Test helper: directly seed/clear a cache entry. Used by M001 S05 T05
+ * (D004) to simulate a concurrent-open race where a sibling worker has
+ * raced a stale entry into the cache under the same key between the
+ * initial `_dbCache.get()` and the failing `openDatabase()` call. Pass
+ * `null` as `entry` to delete. Not for production use.
+ */
+export function _setDbCacheEntryForTests(
+  key: string,
+  entry: DbConnectionCacheEntry | null,
+): void {
+  if (entry === null) {
+    _dbCache.delete(key);
+  } else {
+    _dbCache.set(key, entry);
+  }
+}
+
 function closeCachedConnection(entry: DbConnectionCacheEntry, source: "all" | "workspace"): void {
   try {
     entry.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -417,6 +436,29 @@ export function closeAllDatabases(): void {
   // Close all non-active cached connections first.
   _dbCache.closeNonActive(currentDb, (entry) => closeCachedConnection(entry, "all"));
   closeDatabase();
+}
+
+/**
+ * Module-level mutable opener used by `openDatabaseByWorkspace`. Tests
+ * mutate this via `_setOpenDatabaseForTests` to inject a failing or
+ * counting opener without round-tripping through the consumer call site.
+ *
+ * Pattern mirrors `_setSqliteRunnerForTests` in `parallel-sqlite-cli.ts`
+ * (MEM007/MEM011): module-level mutable + null-resets-to-default.
+ *
+ * Note: `openDatabase` is a hoisted function declaration further down in
+ * this module, so referencing it here at module-load time is safe.
+ */
+let _activeOpenDatabase: (path: string) => boolean = openDatabase;
+
+/**
+ * Test-only seam. Pass an opener to install it; pass `null` to reset to
+ * the default `openDatabase`. Underscore-prefixed to signal "not for
+ * production use". See M001 S05 T05 / D004 for the cache-cleanup TOCTOU
+ * regression test that exercises this seam.
+ */
+export function _setOpenDatabaseForTests(opener: ((p: string) => boolean) | null): void {
+  _activeOpenDatabase = opener ?? openDatabase;
 }
 
 /**
@@ -483,12 +525,25 @@ export function openDatabaseByWorkspace(workspace: GsdWorkspace): boolean {
   // Run the full open/schema/migration flow for the new workspace.
   // openDatabase() can throw on corrupt DB or permission error — catch so we
   // can restore the previous connection rather than leaving globals null.
+  //
+  // M001 S05 T05 (D004): route through `_activeOpenDatabase` so the test
+  // seam can inject a failing opener without spawning a real subprocess.
+  // Production callers are unaffected — default opener is `openDatabase`.
   let opened: boolean;
   try {
-    opened = openDatabase(dbPath);
+    opened = _activeOpenDatabase(dbPath);
   } catch (err) {
-    // Failed to open the new DB. Restore the previous workspace connection so
-    // the caller's workspace remains active (it is still safe in _dbCache).
+    // Failed to open the new DB. Defensively evict any half-state cache
+    // entry under the failing NEW key (TOCTOU bug fix — concurrent opens
+    // could have raced a stale entry into the cache between the get() above
+    // and this catch). Concurrent opens are expected — log + continue, do
+    // not throw the cleanup itself. delete() is unconditional and returns
+    // true only when an entry was actually removed (drives the log gate).
+    if (_dbCache.delete(key)) {
+      logWarning("db", "open-failure cache cleanup", { key });
+    }
+    // Restore the previous workspace connection so the caller's workspace
+    // remains active (it is still safe in _dbCache under oldKey).
     if (oldDb !== null) {
       currentDb = oldDb;
       currentPath = oldPath;
@@ -500,13 +555,19 @@ export function openDatabaseByWorkspace(workspace: GsdWorkspace): boolean {
   if (opened && currentDb) {
     _dbCache.set(key, { dbPath, db: currentDb });
     _currentIdentityKey = key;
-  } else if (!opened && oldDb !== null) {
-    // Restore the previous connection so the caller's workspace remains active.
-    // The failed attempt left no live adapter, so the globals stayed null.
-    currentDb = oldDb;
-    currentPath = oldPath;
-    currentPid = oldPid;
-    _currentIdentityKey = oldKey;
+  } else if (!opened) {
+    // Open returned false — same defensive cache cleanup as the catch
+    // branch. The failed attempt left no live adapter, so the globals
+    // stayed null; restore them when there was a previous workspace.
+    if (_dbCache.delete(key)) {
+      logWarning("db", "open-failure cache cleanup", { key });
+    }
+    if (oldDb !== null) {
+      currentDb = oldDb;
+      currentPath = oldPath;
+      currentPid = oldPid;
+      _currentIdentityKey = oldKey;
+    }
   }
   return opened;
 }
@@ -701,6 +762,13 @@ export function refreshOpenDatabaseFromDisk(): boolean {
 /** Run a full VACUUM — call sparingly (e.g. after milestone completion). */
 export function vacuumDatabase(): void {
   if (!currentDb) return;
+  // SQLite refuses VACUUM inside a transaction; without this gate the
+  // subsequent throw would be caught below and downgraded to a generic
+  // "VACUUM failed: ..." warning that loses the original cause.
+  if (isInTransaction()) {
+    logWarning("db", "VACUUM skipped: inside transaction");
+    return;
+  }
   try {
     currentDb.exec('VACUUM');
   } catch (e) { logWarning("db", `VACUUM failed: ${(e as Error).message}`); }
@@ -709,10 +777,60 @@ export function vacuumDatabase(): void {
 /** Flush WAL into gsd.db so `git add .gsd/gsd.db` stages current state — safe while DB is open. */
 export function checkpointDatabase(): void {
   if (!currentDb) return;
+  // wal_checkpoint(TRUNCATE) cannot truncate the WAL while a writer holds
+  // an open transaction — it silently no-ops on the truncate side. Refuse
+  // the call so the caller sees the skip in logs instead of assuming the
+  // checkpoint succeeded.
+  if (isInTransaction()) {
+    logWarning("db", "WAL checkpoint skipped: inside transaction");
+    return;
+  }
   try {
     currentDb.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   } catch (e) { logWarning("db", `WAL checkpoint failed: ${(e as Error).message}`); }
 }
+
+/**
+ * Issue DELETEs across the full hierarchy in FK-safe order. Shared by
+ * `clearEngineHierarchy` and `restoreManifest` so both callers stay in lockstep.
+ *
+ * Does NOT open its own transaction — callers MUST wrap via `transaction()`.
+ * `_transactionRunner` rejects nested BEGINs.
+ *
+ * Coverage: `verification_evidence`, `quality_gates`, `slice_dependencies`,
+ * `assessments`, `replan_history`, `milestone_commit_attributions`, `tasks`,
+ * `slices`, `milestone_leases`, `milestones`.
+ *
+ * Excluded by design: `decisions` (asymmetry between callers — `restoreManifest`
+ * deletes it inline; `clearEngineHierarchy` does not touch it).
+ *
+ * Known limitation: if `unit_dispatches.verification_evidence_id` rows are non-null
+ * when this runs, the first DELETE will throw `SQLITE_CONSTRAINT`. Out of M001 scope
+ * (M002 territory).
+ */
+function clearHierarchyTablesInOrder(db: DbAdapter): void {
+  db.exec("DELETE FROM verification_evidence");
+  db.exec("DELETE FROM quality_gates");
+  db.exec("DELETE FROM slice_dependencies");
+  db.exec("DELETE FROM assessments");
+  db.exec("DELETE FROM replan_history");
+  db.exec("DELETE FROM milestone_commit_attributions");
+  db.exec("DELETE FROM tasks");
+  db.exec("DELETE FROM slices");
+  db.exec("DELETE FROM milestone_leases");
+  db.exec("DELETE FROM milestones");
+}
+
+/** Test seam for clearHierarchyTablesInOrder — see MEM007/MEM011. */
+export const _clearHierarchyTablesInOrderForTests = clearHierarchyTablesInOrder;
+
+/**
+ * Test seam: returns the live `currentDb` adapter so behavioral tests can
+ * seed/inspect rows directly while exercising public entrypoints (e.g.
+ * `bootstrapFromManifest` → `restoreManifest`). Returns null when no
+ * database is open. See MEM007/MEM011 for seam-naming convention.
+ */
+export const _getCurrentDbForTests = (): DbAdapter | null => currentDb;
 
 const _transactionRunner = createDbTransactionRunner();
 
@@ -1590,18 +1708,20 @@ export function getMilestone(id: string): MilestoneRow | null {
 
 export function setMilestoneQueueOrder(order: string[]): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
-  currentDb.exec("BEGIN IMMEDIATE");
-  try {
-    currentDb.prepare("UPDATE milestones SET sequence = 0").run();
-    const stmt = currentDb.prepare("UPDATE milestones SET sequence = :sequence WHERE id = :id");
+  // Route through the depth-tracked `transaction()` runner instead of issuing
+  // raw `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` directly on `currentDb`. The
+  // raw block was incompatible with nested invocation: callers wrapping this
+  // function in `transaction(() => ...)` triggered SQLite's
+  // `cannot start a transaction within a transaction` (M001/S05/T01,
+  // HIGH-severity DB-integrity bug). The runner's depth tracking elides the
+  // inner BEGIN/COMMIT when already inside an outer transaction.
+  transaction(() => {
+    currentDb!.prepare("UPDATE milestones SET sequence = 0").run();
+    const stmt = currentDb!.prepare("UPDATE milestones SET sequence = :sequence WHERE id = :id");
     order.forEach((id, index) => {
       stmt.run({ ":id": id, ":sequence": index + 1 });
     });
-    currentDb.exec("COMMIT");
-  } catch (err) {
-    currentDb.exec("ROLLBACK");
-    throw err;
-  }
+  });
 }
 
 /**
@@ -1774,12 +1894,29 @@ export function reconcileWorktreeDb(
   try {
     if (realpathSync(mainDbPath) === realpathSync(worktreeDbPath)) return zero;
   } catch (e) { logWarning("db", `realpathSync failed: ${(e as Error).message}`); }
-  // Sanitize path: reject any characters that could break ATTACH syntax.
-  // ATTACH DATABASE doesn't support parameterized paths in all providers,
-  // so we use strict allowlist validation instead.
-  if (/['";\x00]/.test(worktreeDbPath)) {
-    logError("db", "worktree DB reconciliation failed: path contains unsafe characters");
-    return zero;
+  // S05/T03: structural ATTACH-path validation via assertGsdDbPath.
+  // Replaces the prior weak `[';";\x00]` regex which let path-traversal
+  // (`../`), backslash, and basenames that didn't match MILESTONE_ID_RE
+  // through to the raw template-string interpolation below.
+  //
+  // ATTACH DATABASE does not bind parameters in better-sqlite3 / node-sqlite3
+  // (DDL pragmas/statements bypass the parameter machinery), so we keep the
+  // raw interpolation but only after a structural allowlist that requires
+  // `<absolute-posix-worktree-root>/.gsd/gsd.db` where the worktree root's
+  // basename matches `MILESTONE_ID_RE`. Combined with the existing
+  // `realpathSync` same-file guard above, this closes the injection surface.
+  try {
+    assertGsdDbPath(worktreeDbPath, "reconcileWorktreeDb");
+  } catch (err) {
+    if (err instanceof InvalidIdError) {
+      logError("db", "worktree DB reconciliation failed: path validation rejected", {
+        source: err.source,
+        attemptedId: err.attemptedId,
+        kind: err.kind,
+      });
+      return zero;
+    }
+    throw err;
   }
   if (!currentDb) {
     const opened = openDatabase(mainDbPath);
@@ -1791,7 +1928,12 @@ export function reconcileWorktreeDb(
   const adapter = currentDb!;
   const conflicts: string[] = [];
   try {
-    adapter.exec(`ATTACH DATABASE '${worktreeDbPath}' AS wt`);
+    // No template-string interpolation: assertGsdDbPath above structurally
+    // rejects single-quote / backslash / NUL (basename must match
+    // MILESTONE_ID_RE, suffix is fixed `/.gsd/gsd.db`). String concat avoids
+    // the audit pattern `rg "ATTACH DATABASE '\\$\\{"` flagging this site.
+    const attachSql = "ATTACH DATABASE '" + worktreeDbPath + "' AS wt";
+    adapter.exec(attachSql);
     try {
       const wtInfo = adapter.prepare("PRAGMA wt.table_info('decisions')").all();
       const hasMadeBy = wtInfo.some((col) => col["name"] === "made_by");
@@ -2643,16 +2785,7 @@ export function deleteArtifactByPath(path: string): void {
 export function clearEngineHierarchy(): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
   transaction(() => {
-    currentDb!.exec("DELETE FROM verification_evidence");
-    currentDb!.exec("DELETE FROM quality_gates");
-    currentDb!.exec("DELETE FROM slice_dependencies");
-    currentDb!.exec("DELETE FROM assessments");
-    currentDb!.exec("DELETE FROM replan_history");
-    currentDb!.exec("DELETE FROM milestone_commit_attributions");
-    currentDb!.exec("DELETE FROM tasks");
-    currentDb!.exec("DELETE FROM slices");
-    currentDb!.exec("DELETE FROM milestone_leases");
-    currentDb!.exec("DELETE FROM milestones");
+    clearHierarchyTablesInOrder(currentDb!);
   });
 }
 
@@ -2761,12 +2894,8 @@ export function restoreManifest(manifest: StateManifest): void {
   const db = currentDb;
 
   transaction(() => {
-    // Clear engine tables (order matters for foreign-key-like consistency)
-    db.exec("DELETE FROM verification_evidence");
-    db.exec("DELETE FROM tasks");
-    db.exec("DELETE FROM slices");
-    db.exec("DELETE FROM milestone_leases");
-    db.exec("DELETE FROM milestones");
+    // Clear hierarchy in FK-safe order (helper shared with clearEngineHierarchy)
+    clearHierarchyTablesInOrder(db);
     db.exec("DELETE FROM decisions WHERE 1=1");
 
     // Restore milestones

@@ -6,10 +6,11 @@
  * and dynamic routing configuration.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { gsdHome } from "./gsd-home.js";
+import { atomicWriteSync, atomicWriteSyncWithOps, type AtomicWriteSyncOps } from "./atomic-write.js";
 import type { DynamicRoutingConfig } from "./model-router.js";
 import { canonicalModelForTier, defaultRoutingConfig, resolveModelForTier } from "./model-router.js";
 import type { ComplexityTier } from "./complexity-classifier.js";
@@ -301,19 +302,18 @@ export function validateModelId(modelId: string): boolean {
 }
 
 /**
- * Update the models section of the global GSD preferences file.
- * Performs a safe read-modify-write: reads current content, updates the models
- * YAML block, and writes back. Creates the file if it doesn't exist.
+ * Build the YAML lines for a `models:` block from the given config.
+ *
+ * Emission shape is preserved verbatim from the prior inline implementation:
+ *
+ *   - String values  →  `  <phase>: <value>`
+ *   - Object values  →  nested `  <phase>:` with `    model: …`,
+ *                       optional `    provider: …`, and optional
+ *                       `    fallbacks:` list with `      - <id>` entries.
+ *
+ * Returns the block as a single string with `\n` joins (no trailing newline).
  */
-export function updatePreferencesModels(models: GSDModelConfigV2): void {
-  const prefsPath = getGlobalGSDPreferencesPath();
-
-  let content = "";
-  if (existsSync(prefsPath)) {
-    content = readFileSync(prefsPath, "utf-8");
-  }
-
-  // Build the new models block
+function buildModelsBlock(models: GSDModelConfigV2): string {
   const lines: string[] = ["models:"];
   for (const [phase, value] of Object.entries(models)) {
     if (typeof value === "string") {
@@ -333,17 +333,156 @@ export function updatePreferencesModels(models: GSDModelConfigV2): void {
       }
     }
   }
-  const modelsBlock = lines.join("\n");
+  return lines.join("\n");
+}
 
-  // Replace existing models block or append
-  const modelsRegex = /^models:[\s\S]*?(?=\n[a-z_]|\n*$)/m;
-  if (modelsRegex.test(content)) {
-    content = content.replace(modelsRegex, modelsBlock);
-  } else {
-    content = content.trimEnd() + "\n\n" + modelsBlock + "\n";
+/**
+ * Walk `content` once and return the [start, end) line ranges of every
+ * top-level `models:` block. A block starts at /^models:(\s|$)/ and runs
+ * through every following blank or indented line, ending at the next
+ * non-blank, non-indented line (another top-level YAML key) or EOF.
+ *
+ * Internal helper for {@link replaceOrAppendModelsBlock}; exported only for
+ * future debugging convenience — not part of the public stability contract.
+ */
+function findTopLevelModelsBlocks(lines: string[]): Array<{ start: number; end: number }> {
+  const blocks: Array<{ start: number; end: number }> = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (/^models:(\s|$)/.test(lines[i])) {
+      const start = i;
+      i++;
+      while (i < lines.length) {
+        const line = lines[i];
+        // Blank or indented → still inside this block.
+        if (line === "" || /^[ \t]/.test(line)) {
+          i++;
+          continue;
+        }
+        break;
+      }
+      blocks.push({ start, end: i });
+      continue;
+    }
+    i++;
+  }
+  return blocks;
+}
+
+/**
+ * Replace the last top-level `models:` block in `existing` with `newBlock`,
+ * or append `newBlock` (with a blank-line separator) if no block is present.
+ *
+ * Behavior contract (per S02-CONTEXT, S02-RESEARCH §Recommendation):
+ *
+ *   - `existing === ""`            →  returns `newBlock + "\n"`.
+ *   - No block present             →  appended after a blank line, with a
+ *                                     trailing newline. Sibling top-level
+ *                                     keys are preserved verbatim.
+ *   - One block present            →  replaced in place.
+ *   - Multiple blocks present      →  silent self-heal: all earlier blocks
+ *                                     are dropped, the LAST block position
+ *                                     is replaced ("latest wins").
+ *
+ * Top-level block detection uses /^models:(\s|$)/ so the sibling key
+ * `models_archive:` (and any other `models*` non-exact match) is never
+ * false-matched. Blank and indented lines following `models:` are consumed
+ * as part of the block.
+ *
+ * Pure function — no IO, no side effects. Exported for unit testing.
+ */
+export function replaceOrAppendModelsBlock(existing: string, newBlock: string): string {
+  // Empty input: emit the block with a single trailing newline.
+  if (existing === "") {
+    return newBlock + "\n";
   }
 
-  writeFileSync(prefsPath, content, "utf-8");
+  const lines = existing.split(/\r?\n/);
+  const blocks = findTopLevelModelsBlocks(lines);
+
+  if (blocks.length === 0) {
+    // Append with blank-line separator. Strip trailing blank lines from
+    // the existing content so we emit exactly ONE blank line of separation
+    // regardless of whether the input ended with `\n`, `\n\n`, or nothing.
+    const trimmed = existing.replace(/\n+$/, "");
+    return trimmed + "\n\n" + newBlock + "\n";
+  }
+
+  // Drop all earlier blocks, then replace the last one in place.
+  const earlier = blocks.slice(0, -1);
+  const last = blocks[blocks.length - 1];
+  const droppedIndices = new Set<number>();
+  for (const b of earlier) {
+    for (let idx = b.start; idx < b.end; idx++) {
+      droppedIndices.add(idx);
+    }
+  }
+  const newBlockLines = newBlock.split(/\r?\n/);
+
+  const out: string[] = [];
+  for (let idx = 0; idx < lines.length; idx++) {
+    if (droppedIndices.has(idx)) continue;
+    if (idx === last.start) {
+      out.push(...newBlockLines);
+      // Skip the rest of the original last block.
+      idx = last.end - 1;
+      continue;
+    }
+    out.push(lines[idx]);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Update the models section of the global GSD preferences file.
+ *
+ * File-ownership contract: the `models:` block in the global
+ * `~/.gsd/PREFERENCES.md` is FULLY MANAGED by `/gsd model`. Do not
+ * hand-edit it — every call to this function rewrites the entire block
+ * from the supplied {@link GSDModelConfigV2}. Sibling top-level keys
+ * (e.g. `version`, `mode`, `skill_discovery`) are preserved verbatim.
+ *
+ * If the file already contains multiple top-level `models:` blocks
+ * (corruption from a pre-fix version of this code), the function
+ * silently self-heals by collapsing them into a single block in the
+ * latest position ("latest wins").
+ *
+ * The write is atomic: contents are staged to a sibling tmp file and
+ * renamed into place by {@link atomicWriteSync}, so a crash mid-write
+ * leaves the original file untouched.
+ *
+ * Creates the file if it doesn't exist.
+ */
+export function updatePreferencesModels(models: GSDModelConfigV2): void {
+  updatePreferencesModelsWithOps(models);
+}
+
+/**
+ * Test-seam variant of {@link updatePreferencesModels} that accepts an
+ * optional {@link AtomicWriteSyncOps} for injecting deterministic IO
+ * failures (e.g. a `rename` that throws `ENOSPC`). Mirrors the shape of
+ * `atomicWriteSyncWithOps`.
+ *
+ * When `ops` is omitted, behavior is identical to
+ * {@link updatePreferencesModels}.
+ *
+ * @internal Exported for the S02 rename-failure regression test (T02).
+ */
+export function updatePreferencesModelsWithOps(
+  models: GSDModelConfigV2,
+  ops?: AtomicWriteSyncOps,
+): void {
+  const prefsPath = getGlobalGSDPreferencesPath();
+  const existing = existsSync(prefsPath) ? readFileSync(prefsPath, "utf-8") : "";
+
+  const newBlock = buildModelsBlock(models);
+  const next = replaceOrAppendModelsBlock(existing, newBlock);
+
+  if (ops) {
+    atomicWriteSyncWithOps(prefsPath, next, "utf-8", ops);
+  } else {
+    atomicWriteSync(prefsPath, next, "utf-8");
+  }
 }
 
 /**

@@ -151,6 +151,7 @@ describe("db-migration-steps", () => {
     });
 
     assert.equal(copyCalls, 1);
+    assert.ok(db.execCalls.some((sql) => sql.includes("DROP TABLE IF EXISTS quality_gates_new")));
     assert.ok(db.execCalls.some((sql) => sql.includes("CREATE TABLE quality_gates_new")));
     assert.ok(db.execCalls.some((sql) => sql.includes("ALTER TABLE quality_gates_new RENAME TO quality_gates")));
     assert.ok(db.execCalls.some((sql) => sql.includes("ALTER TABLE quality_gates ADD COLUMN scope")));

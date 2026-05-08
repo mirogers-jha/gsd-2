@@ -10,7 +10,6 @@
 
 import { existsSync, statSync, readFileSync, openSync, readSync, closeSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
 
 import type { Theme } from "@gsd/pi-coding-agent";
 import { truncateToWidth, visibleWidth, matchesKey, Key } from "@gsd/pi-tui";
@@ -18,6 +17,9 @@ import { truncateToWidth, visibleWidth, matchesKey, Key } from "@gsd/pi-tui";
 import { formatDuration, STATUS_GLYPH, STATUS_COLOR } from "../shared/mod.js";
 import { formattedShortcutPair } from "./shortcut-defs.js";
 import { resolveGsdPathContract } from "./paths.js";
+import { runSqliteCli } from "./parallel-sqlite-cli.js";
+import { InvalidIdError } from "./milestone-ids.js";
+import { logError } from "./workflow-logger.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -127,20 +129,28 @@ function discoverWorkers(basePath: string): string[] {
 }
 
 function querySliceProgress(basePath: string, mid: string): SliceProgress[] {
-  const workRoot = join(basePath, ".gsd", "worktrees", mid);
-  const dbPath = resolveGsdPathContract(workRoot, basePath).projectDb;
-  if (!existsSync(dbPath)) return [];
-
   try {
+    const workRoot = join(basePath, ".gsd", "worktrees", mid);
+    const dbPath = resolveGsdPathContract(workRoot, basePath).projectDb;
+    if (!existsSync(dbPath)) return [];
+
     const sql = `SELECT s.id, s.status, COUNT(t.id), SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) FROM slices s LEFT JOIN tasks t ON s.milestone_id=t.milestone_id AND s.id=t.slice_id WHERE s.milestone_id='${mid}' GROUP BY s.id ORDER BY s.id`;
-    const result = spawnSync("sqlite3", [dbPath, sql], { timeout: 3000, encoding: "utf-8" });
+    const result = runSqliteCli({ dbPath, sql, mid });
     const out = (result.stdout || "").trim();
     if (!out || result.status !== 0) return [];
     return out.split("\n").map((line) => {
       const [id, status, total, done] = line.split("|");
       return { id, status, total: parseInt(total, 10), done: parseInt(done || "0", 10) };
     });
-  } catch {
+  } catch (e) {
+    if (e instanceof InvalidIdError) {
+      logError("parallel", "rejected ID at sqlite3 boundary", {
+        source: "querySliceProgress",
+        attemptedId: e.attemptedId,
+        kind: e.kind,
+      });
+      return [];
+    }
     return [];
   }
 }
@@ -168,19 +178,27 @@ function extractCostFromNdjson(basePath: string, mid: string): number {
 }
 
 function queryRecentCompletions(basePath: string, mid: string): string[] {
-  const workRoot = join(basePath, ".gsd", "worktrees", mid);
-  const dbPath = resolveGsdPathContract(workRoot, basePath).projectDb;
-  if (!existsSync(dbPath)) return [];
   try {
+    const workRoot = join(basePath, ".gsd", "worktrees", mid);
+    const dbPath = resolveGsdPathContract(workRoot, basePath).projectDb;
+    if (!existsSync(dbPath)) return [];
     const sql = `SELECT id, slice_id, one_liner FROM tasks WHERE milestone_id='${mid}' AND status='complete' AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 5`;
-    const result = spawnSync("sqlite3", [dbPath, sql], { timeout: 3000, encoding: "utf-8" });
+    const result = runSqliteCli({ dbPath, sql, mid });
     const out = (result.stdout || "").trim();
     if (!out || result.status !== 0) return [];
     return out.split("\n").map((line) => {
       const [taskId, sliceId, oneLiner] = line.split("|");
       return `✓ ${mid}/${sliceId}/${taskId}${oneLiner ? ": " + oneLiner : ""}`;
     });
-  } catch {
+  } catch (e) {
+    if (e instanceof InvalidIdError) {
+      logError("parallel", "rejected ID at sqlite3 boundary", {
+        source: "queryRecentCompletions",
+        attemptedId: e.attemptedId,
+        kind: e.kind,
+      });
+      return [];
+    }
     return [];
   }
 }

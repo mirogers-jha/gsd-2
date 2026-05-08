@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Bug List
 
 20 parallel review agents covered the entire directory tree (subdirectories excluded only for test scaffolding, prompts/templates, and fixture data). Findings below are aggregated and tiered. Each item carries `file:line` so you can jump to it.
@@ -130,3 +131,120 @@
 - `slice-cadence.ts:185,257,282,343` — `process.chdir` is process-global; concurrent merges corrupt `cwd` for everything else in the process.
 - `slice-parallel-conflict.ts:24-36` — File-extraction regex requires leading non-word char; misses paths at line start. Empty extraction silently allowed (contradicts "conservative" comment).
 - `guided-flow.ts:536-725,919-989` — `_getPendingAutoStart()` returns `null` with >1 entries; multi-project sessions break recovery silently.
+=======
+# Bug List Annotations (M001/S01, M001/S02, M001/S03, M001/S04, M001/S05)
+
+This file is a **worktree-local annotation** for the canonical bug list at
+`.bugs/bug-list.md` in the project root. The S01 worktree-isolation guard
+(`git.isolation: worktree`) blocks writes to the canonical file from inside the
+M001 worktree, so the fix-confirmation notes below are recorded here. The merge
+back to main should be followed up by manually editing the canonical rows, or by
+relaxing the guard for `.bugs/` (see follow-up note in `T04-SUMMARY.md` and
+`.gsd/milestones/M001/slices/S05/forward-note.md`).
+
+## Forward Note (post-merge)
+
+After M001 merges to main, manually annotate the canonical
+`.bugs/bug-list.md` rows for **CRITICAL #3** and **CRITICAL #4** with their
+respective `[FIXED M001/S01]` and `[FIXED M001/S02]` tags. The worktree-isolation
+guard re-blocks these edits on every subsequent worktree, so the canonical file
+must be touched from a non-worktree checkout (or with
+`GSD_DISABLE_WORKTREE_WRITE_GUARD=1` set during a maintenance commit).
+
+S03, S04, and S05 forward-notes (in their respective slice directories) describe
+the additional canonical-file annotations to apply post-merge for CRITICAL #1,
+CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
+
+## CRITICAL #3 — sqlite3 CLI SQL injection via worktree directory names
+
+| Field | Value |
+|-------|-------|
+| Original location | `parallel-merge.ts:48` & `parallel-monitor-overlay.ts:135,175` |
+| Issue | SQL injection via worktree directory names interpolated into sqlite3 CLI queries. Filename allowlist was weak (`startsWith("M")`). |
+| Status | **[FIXED M001/S01]** |
+| Validators | `assertMilestoneId` / `assertSliceId` / `assertTaskId` / `assertWorktreePath` in `src/resources/extensions/gsd/milestone-ids.ts` |
+| Boundary wrapper | `runSqliteCli` in `src/resources/extensions/gsd/parallel-sqlite-cli.ts` (calls `assertMilestoneId(args.mid, 'runSqliteCli')` before composing SQL) |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/parallel-merge-rejects-malicious-worktree-name.test.ts` |
+| Fix evidence | `.gsd/milestones/M001/slices/S01/tasks/T04-SUMMARY.md` (D004 gate) |
+
+## CRITICAL #4 — preferences-models.ts:339,346 — broken regex + non-atomic write
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/preferences-models.ts:339` (regex), `:346` (non-atomic `writeFileSync`) |
+| Issue | `updatePreferencesModels` regex `^models:[\s\S]*?(?=\n[a-z_]\|\n*$)` collapses to just the literal `models:` (lookahead matches at first newline). Every `/gsd model …` write injects a duplicate `models:` block instead of replacing — corrupting YAML. Combined with non-atomic `writeFileSync`, a SIGINT mid-write wipes all preferences. |
+| Status | **[FIXED M001/S02]** |
+| Fix (regex) | Replaced `String.replace(regex, …)` with line-walker `replaceOrAppendModelsBlock` that finds the `^models:` line, walks forward consuming nested-indented continuation lines until the next top-level key (or EOF), and self-heals duplicate `models:` blocks transparently. Pure function; only `replaceOrAppendModelsBlock` is exported (the `buildModelsBlock` helper stays private). |
+| Fix (atomic write) | `updatePreferencesModels` now routes through `atomicWriteSync` (already used elsewhere in the codebase). On rename failure (e.g. ENOSPC), the original `~/.gsd/PREFERENCES.md` is left intact and the wrapped error from `buildAtomicWriteError` includes `{path, attempts, code}` context. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/preferences-models-regex-and-atomic-write.test.ts` (9 branch-coverage subtests + 1 rename-failure seam test + 1 five-iteration round-trip behavioral test). D004 gate verified: 6 fails pre-fix → 11/11 pass post-fix. |
+| Fix evidence | `.gsd/milestones/M001/slices/S02/tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
+
+## CRITICAL #1 — gsd-db.ts:2759-2770 — restoreManifest FK violation under PRAGMA foreign_keys=ON
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:2759-2770` (`restoreManifest`) |
+| Issue | `restoreManifest()` cleared `milestones`, `slices`, `tasks`, `verification_evidence` directly, leaving FK-bearing children (`quality_gates`, `slice_dependencies`, `replan_history`, `assessments`, `milestone_commit_attributions`, `requirement_coverage`, `gate_results`) untouched. With `PRAGMA foreign_keys = ON` (set in `initSchema`), the parent DELETE throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed` and the entire restore rolls back, leaving `bootstrapFromManifest` consumers without recovery. |
+| Status | **[FIXED M001/S03]** |
+| Fix | Extracted private `clearHierarchyTablesInOrder(db: DbAdapter)` covering all 10 hierarchy tables in FK-safe order (children → parents). Rewired both `restoreManifest` and `clearEngineHierarchy` through the helper under existing `transaction()` wrappers — single source of truth for hierarchy DELETE order. Helper does NOT open its own transaction (caller wraps; honors `_transactionRunner` no-nested-BEGIN invariant). |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/restore-manifest-fk-violation-rolls-back.test.ts` — exercises `bootstrapFromManifest` against a non-empty seeded hierarchy with `PRAGMA foreign_keys=ON`. D004 gate captured: pre-fix throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed`; post-fix passes (5/5). |
+| Order verification | `src/resources/extensions/gsd/tests/clear-hierarchy-tables-in-order.test.ts` — recording-fake DbAdapter asserts exact 10-table DELETE order via `assert.deepEqual` on full captured-SQL array (reorder/omit/add all fail). |
+| Fix evidence | `.gsd/milestones/M001/slices/S03/tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
+
+## HIGH (S05) — `gsd-db.ts:1591-1605` — setMilestoneQueueOrder raw `BEGIN IMMEDIATE` outside `_transactionRunner`
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:1591-1605` (`setMilestoneQueueOrder`) — post-fix body at lines 1709-1726 |
+| Issue | Raw `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` issued directly on `currentDb` outside the depth-tracked `_transactionRunner`. Nested invocation (caller wrapping `setMilestoneQueueOrder` in `transaction(() => …)`) triggers SQLite's `cannot start a transaction within a transaction` and corrupts the runner's depth tracker. |
+| Status | **[FIXED M001/S05]** |
+| Fix | Replaced the raw try/begin/commit/rollback block with a single `transaction(() => …)` call routing both UPDATEs through `_transactionRunner`. Depth tracker elides the inner BEGIN/COMMIT when already inside an outer transaction. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/set-milestone-queue-order-uses-transaction-runner.test.ts` (D004 RED/GREEN captured at `.gsd/milestones/M001/slices/S05/tasks/T01-prefix-failure.txt` / `T01-postfix-pass.txt`) |
+| Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T01-SUMMARY.md` |
+
+## HIGH (S05) — `gsd-db.ts:702-715` — vacuumDatabase / checkpointDatabase missing `isInTransaction()` gate
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:702-715` (`vacuumDatabase`, `checkpointDatabase`) — post-fix bodies at lines 765-797 |
+| Issue | `VACUUM` and `PRAGMA wal_checkpoint(TRUNCATE)` are destructive whole-DB operations that SQLite forbids inside a transaction; running them inside an `isInTransaction()` window throws cryptic `cannot VACUUM from within a transaction` and rolls back the enclosing tx. |
+| Status | **[FIXED M001/S05]** |
+| Fix | Added `if (isInTransaction()) { logWarning('db', 'VACUUM skipped: inside transaction'); return; }` early-return at the top of both functions (skip-with-warning, not throw) so wrappers that opportunistically call vacuum/checkpoint inside a tx silently no-op rather than blowing up the outer transaction. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/vacuum-checkpoint-skips-inside-transaction.test.ts` (D004 RED/GREEN captured at `.gsd/milestones/M001/slices/S05/tasks/T02-prefix-failure.txt` / `T02-postfix-pass.txt`) |
+| Failure-visibility log | `logWarning('db', 'VACUUM skipped: inside transaction')` / `logWarning('db', 'WAL checkpoint skipped: inside transaction')` — searchable via `rg 'inside transaction' .gsd/activity/` |
+| Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T02-SUMMARY.md` |
+
+## HIGH (S05) — `gsd-db.ts:1793-1794` — ATTACH DATABASE raw template-string interpolation
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:1793-1794` (`ATTACH DATABASE '${worktreeDbPath}' AS wt`) — post-fix call site at lines 1836-1875 |
+| Issue | Worktree DB path interpolated directly into DDL string. The pre-existing weak `[';";\x00]` regex did not block backslashes, embedded-newline-then-comment, or other path payloads; `better-sqlite3`/`node-sqlite3` cannot bind DDL parameters so `prepare('ATTACH DATABASE ? AS wt')` is not viable (MEM030). Path-shaped attacks slipped through. |
+| Status | **[FIXED M001/S05]** |
+| Fix | Added new `assertGsdDbPath(p, source)` exported helper at `milestone-ids.ts:272` (reuses existing `'worktree-path'` `InvalidIdKind` discriminator) that requires the path end in `<root>/.gsd/gsd.db` where `<root>` is a directory whose basename matches `MILESTONE_ID_RE`. Production call site now validates with `assertGsdDbPath(worktreeDbPath, 'attachWorktreeDb')` before string-concat ATTACH; structured `InvalidIdError` re-thrown via existing `logError('db', …)` so forensics see `{ source, attemptedId, kind }`. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/attach-database-rejects-malicious-worktree-path.test.ts` — 11 assertions (validator unit + behavioral D004). Captures at `.gsd/milestones/M001/slices/S05/tasks/T03-prefix-failure.txt` / `T03-postfix-pass.txt`. |
+| Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T03-SUMMARY.md` |
+
+## HIGH (S05) — `db/unit-dispatches.ts:269-271` — markFailed treats `retryAfterMs === 0` as no-retry
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/db/unit-dispatches.ts:269-271` (`markFailed`) — post-fix body at lines 269-274 |
+| Issue | Truthy ternary (`opts.retryAfterMs ? new Date(...).toISOString() : null`) treated `retryAfterMs === 0` as "no retry" instead of "schedule immediate retry now", silently dropping immediate-retry semantics that operability code relies on. |
+| Status | **[FIXED M001/S05]** |
+| Fix | Replaced ternary with explicit `(typeof opts.retryAfterMs === 'number') ? ... : null` guard. Documents intent (numeric ms value) and rejects accidental string/object passes that `!= null` would silently allow. 3-line comment block tagging D004/M001/S05/T04 above the new check for forensics. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/mark-failed-retry-after-ms-zero-retries-immediately.test.ts` (2-case D004 regression: immediate-retry + no-retry path). Captures at `.gsd/milestones/M001/slices/S05/tasks/T04-prefix-failure.txt` / `T04-postfix-pass.txt`. |
+| Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T04-SUMMARY.md` |
+
+## HIGH (S05) — `gsd-db.ts:438-512` — openDatabaseByWorkspace cache TOCTOU on open-failure
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:438-512` (`openDatabaseByWorkspace`) — post-fix body at lines 437-573 |
+| Issue | Snapshot/restore around `openDatabase(key)` left a stale cached entry in `_dbCache` if the open path threw or returned `!opened`. A subsequent retry against the same workspace key would either short-circuit on the stale entry or race with a concurrent opener — both branches eventually corrupted the cache. |
+| Status | **[FIXED M001/S05]** |
+| Fix | Defensive `_dbCache.delete(key)` on both failure branches (`throw` and `!opened`) plus `logWarning('db', 'open-failure cache cleanup', { key })`. Widened the `else if (!opened && oldDb !== null)` guard to `else if (!opened)` with nested `if (oldDb !== null)` so cleanup fires even when there's no previous workspace to restore to. New `_setOpenDatabaseForTests(opener)` seam (mirrors S01's `_setSqliteRunnerForTests`) routes through `_activeOpenDatabase` for deterministic D005 seam-injection tests; new `_setDbCacheEntryForTests(key, entry)` helper plants stale entries in tests to simulate the concurrent-open race without spawning threads. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/open-database-by-workspace-cleans-cache-on-open-failure.test.ts` — 3 sub-tests (throw branch + !opened branch with seam-planted stale entry; seam-reset smoke test). Captures at `.gsd/milestones/M001/slices/S05/tasks/T05-prefix-failure.txt` / `T05-postfix-pass.txt`. |
+| Failure-visibility log | `logWarning('db', 'open-failure cache cleanup', { key })` — searchable via `rg 'open-failure cache' .gsd/activity/` |
+| Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T05-SUMMARY.md` |
+>>>>>>> milestone/M001
