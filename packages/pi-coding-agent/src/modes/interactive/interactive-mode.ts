@@ -173,8 +173,20 @@ type CompactionQueuedMessage = {
 
 export type ExtensionNotifyType = "info" | "warning" | "error" | "success" | undefined;
 
-export function shouldRenderExtensionNotifyInChat(type: ExtensionNotifyType): boolean {
-	return type !== "warning";
+/**
+ * Whether an extension notification of `type` should render inline in chat.
+ *
+ * History: commit ea87252d0 ("quiet auto-mode warning noise") suppressed all
+ * warnings to silence noisy auto-mode logging. That broke every legitimate
+ * `ctx.ui.notify(..., "warning")` call site — the entire `/gsd doctor` report,
+ * `/gsd capture` usage hints, `/gsd skip` usage hints, and many more vanished
+ * from the TUI. Auto-mode noise is the right thing to suppress at the source
+ * (workflow-logger), not by muting the whole extension UI channel.
+ *
+ * Kept as a pure exported predicate so tests can lock in the policy.
+ */
+export function shouldRenderExtensionNotifyInChat(_type: ExtensionNotifyType): boolean {
+	return true;
 }
 
 export interface ExtensionNotifyRenderResult {
@@ -197,6 +209,10 @@ export function renderExtensionNotifyInChat(
 
 	if (type === "error") {
 		chatContainer.addChild(new Text(theme.fg("error", `Error: ${message}`), 1, 0));
+		return { rendered: true };
+	}
+	if (type === "warning") {
+		chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${message}`), 1, 0));
 		return { rendered: true };
 	}
 	if (type === "success") {

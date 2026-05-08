@@ -28,24 +28,17 @@ before(() => {
 	initTheme("dark");
 });
 
-describe("Extension warning notifications", () => {
-	it("do not render into chat output", () => {
-		assert.equal(shouldRenderExtensionNotifyInChat("warning"), false);
+describe("Extension notifications", () => {
+	it("render every severity (including warning) into chat output", () => {
+		// All severities must render: muting warnings broke /gsd doctor and several
+		// other commands. See shouldRenderExtensionNotifyInChat() docs for history.
+		assert.equal(shouldRenderExtensionNotifyInChat("warning"), true);
 		assert.equal(shouldRenderExtensionNotifyInChat("error"), true);
 		assert.equal(shouldRenderExtensionNotifyInChat("success"), true);
 		assert.equal(shouldRenderExtensionNotifyInChat("info"), true);
 		assert.equal(shouldRenderExtensionNotifyInChat(undefined), true);
 
-		const warningChat = new Container();
-		const warningResult = renderExtensionNotifyInChat(warningChat, "extension warning", "warning");
-		assert.equal(warningResult.rendered, false);
-		assert.equal(
-			warningChat.render(80).map(stripAnsi).join("\n"),
-			"",
-			"warning notifications must not add chat output",
-		);
-
-		for (const type of ["error", "success", "info"] as const) {
+		for (const type of ["error", "warning", "success", "info"] as const) {
 			const chat = new Container();
 			const result = renderExtensionNotifyInChat(chat, `${type} notification`, type);
 			assert.equal(result.rendered, true, `${type} notification should render`);
