@@ -1,7 +1,8 @@
-<<<<<<< HEAD
 # Bug List
 
 20 parallel review agents covered the entire directory tree (subdirectories excluded only for test scaffolding, prompts/templates, and fixture data). Findings below are aggregated and tiered. Each item carries `file:line` so you can jump to it.
+
+> **M001 status (merged):** all four CRITICALs and five S05 HIGH DB-integrity items below are fixed. Inline `[FIXED M001/Sxx]` tags mark the rows; full provenance (validators, tests, captures, log-strings) lives in the **M001 Fix Provenance** section at the bottom of this file.
 
 ---
 
@@ -9,10 +10,10 @@
 
 | # | File:Line | Issue |
 |---|-----------|-------|
-| 1 | `gsd-db.ts:2759-2769` | `restoreManifest()` deletes parent slices/tasks/milestones without first removing `quality_gates`, `slice_dependencies`, `replan_history`, `assessments`, `milestone_commit_attributions`. With `PRAGMA foreign_keys = ON` (enabled in `initSchema`) the DELETE will throw and roll back the entire restore. Mirror `clearEngineHierarchy()` ordering. |
-| 2 | `db-migration-steps.ts:435-456` | v22 migration creates `quality_gates_new` without `IF NOT EXISTS`; a partial-then-retry run hits "table already exists". Add `DROP TABLE IF EXISTS quality_gates_new` or `IF NOT EXISTS`. |
-| 3 | `parallel-merge.ts:48` & `parallel-monitor-overlay.ts:135,175` | SQL injection via worktree directory names interpolated into `sqlite3` CLI queries. Filename allowlist is weak (`startsWith("M")`). Validate against `/^M\d{3}[A-Z0-9-]*$/` or use bound parameters. |
-| 4 | `preferences-models.ts:339` | `updatePreferencesModels` regex `^models:[\s\S]*?(?=\n[a-z_]|\n*$)` collapses to just the literal `"models:"` (lookahead matches at first newline). Every `/gsd model …` write injects a duplicate `models` block instead of replacing — corrupting YAML. Combined with non-atomic `writeFileSync` on line 346, a SIGINT mid-write wipes all preferences. |
+| 1 | `gsd-db.ts:2759-2769` | `restoreManifest()` deletes parent slices/tasks/milestones without first removing `quality_gates`, `slice_dependencies`, `replan_history`, `assessments`, `milestone_commit_attributions`. With `PRAGMA foreign_keys = ON` (enabled in `initSchema`) the DELETE will throw and roll back the entire restore. Mirror `clearEngineHierarchy()` ordering. **[FIXED M001/S03]** |
+| 2 | `db-migration-steps.ts:435-456` | v22 migration creates `quality_gates_new` without `IF NOT EXISTS`; a partial-then-retry run hits "table already exists". Add `DROP TABLE IF EXISTS quality_gates_new` or `IF NOT EXISTS`. **[FIXED M001/S04]** |
+| 3 | `parallel-merge.ts:48` & `parallel-monitor-overlay.ts:135,175` | SQL injection via worktree directory names interpolated into `sqlite3` CLI queries. Filename allowlist is weak (`startsWith("M")`). Validate against `/^M\d{3}[A-Z0-9-]*$/` or use bound parameters. **[FIXED M001/S01]** |
+| 4 | `preferences-models.ts:339` | `updatePreferencesModels` regex `^models:[\s\S]*?(?=\n[a-z_]|\n*$)` collapses to just the literal `"models:"` (lookahead matches at first newline). Every `/gsd model …` write injects a duplicate `models` block instead of replacing — corrupting YAML. Combined with non-atomic `writeFileSync` on line 346, a SIGINT mid-write wipes all preferences. **[FIXED M001/S02]** |
 
 ---
 
@@ -39,11 +40,11 @@
 
 ### DB
 
-- `gsd-db.ts:1591-1605` — `setMilestoneQueueOrder` issues raw `BEGIN IMMEDIATE` outside `_transactionRunner`; nested call corrupts depth tracker.
-- `gsd-db.ts:702-715` — `vacuumDatabase`/`checkpointDatabase` don't gate on `isInTransaction()`.
-- `gsd-db.ts:1793-1794` — `ATTACH DATABASE '${worktreeDbPath}'` raw string interpolation (allowlist regex doesn't block backslashes); use `ATTACH DATABASE ?`.
-- `gsd-db.ts:438-512` — `openDatabaseByWorkspace` snapshot/restore leaves a stale cached entry on open-failure.
-- `db/unit-dispatches.ts:269-271` — `markFailed` treats `retryAfterMs === 0` as "no retry" instead of immediate retry.
+- `gsd-db.ts:1591-1605` — `setMilestoneQueueOrder` issues raw `BEGIN IMMEDIATE` outside `_transactionRunner`; nested call corrupts depth tracker. **[FIXED M001/S05]**
+- `gsd-db.ts:702-715` — `vacuumDatabase`/`checkpointDatabase` don't gate on `isInTransaction()`. **[FIXED M001/S05]**
+- `gsd-db.ts:1793-1794` — `ATTACH DATABASE '${worktreeDbPath}'` raw string interpolation (allowlist regex doesn't block backslashes); use `ATTACH DATABASE ?`. **[FIXED M001/S05]**
+- `gsd-db.ts:438-512` — `openDatabaseByWorkspace` snapshot/restore leaves a stale cached entry on open-failure. **[FIXED M001/S05]**
+- `db/unit-dispatches.ts:269-271` — `markFailed` treats `retryAfterMs === 0` as "no retry" instead of immediate retry. **[FIXED M001/S05]**
 
 ### Commands
 
@@ -131,31 +132,38 @@
 - `slice-cadence.ts:185,257,282,343` — `process.chdir` is process-global; concurrent merges corrupt `cwd` for everything else in the process.
 - `slice-parallel-conflict.ts:24-36` — File-extraction regex requires leading non-word char; misses paths at line start. Empty extraction silently allowed (contradicts "conservative" comment).
 - `guided-flow.ts:536-725,919-989` — `_getPendingAutoStart()` returns `null` with >1 entries; multi-project sessions break recovery silently.
-=======
-# Bug List Annotations (M001/S01, M001/S02, M001/S03, M001/S04, M001/S05)
 
-This file is a **worktree-local annotation** for the canonical bug list at
-`.bugs/bug-list.md` in the project root. The S01 worktree-isolation guard
-(`git.isolation: worktree`) blocks writes to the canonical file from inside the
-M001 worktree, so the fix-confirmation notes below are recorded here. The merge
-back to main should be followed up by manually editing the canonical rows, or by
-relaxing the guard for `.bugs/` (see follow-up note in `T04-SUMMARY.md` and
-`.gsd/milestones/M001/slices/S05/forward-note.md`).
+---
 
-## Forward Note (post-merge)
+## M001 Fix Provenance
 
-After M001 merges to main, manually annotate the canonical
-`.bugs/bug-list.md` rows for **CRITICAL #3** and **CRITICAL #4** with their
-respective `[FIXED M001/S01]` and `[FIXED M001/S02]` tags. The worktree-isolation
-guard re-blocks these edits on every subsequent worktree, so the canonical file
-must be touched from a non-worktree checkout (or with
-`GSD_DISABLE_WORKTREE_WRITE_GUARD=1` set during a maintenance commit).
+The tables below record validators, tests, captures, and log-strings for every bug M001 closed. Tags above (`[FIXED M001/Sxx]`) point here.
 
-S03, S04, and S05 forward-notes (in their respective slice directories) describe
-the additional canonical-file annotations to apply post-merge for CRITICAL #1,
-CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
+### CRITICAL #1 — `gsd-db.ts:2759-2770` — `restoreManifest` FK violation under `PRAGMA foreign_keys = ON`
 
-## CRITICAL #3 — sqlite3 CLI SQL injection via worktree directory names
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/gsd-db.ts:2759-2770` (`restoreManifest`) |
+| Issue | `restoreManifest()` cleared `milestones`, `slices`, `tasks`, `verification_evidence` directly, leaving FK-bearing children (`quality_gates`, `slice_dependencies`, `replan_history`, `assessments`, `milestone_commit_attributions`, `requirement_coverage`, `gate_results`) untouched. With `PRAGMA foreign_keys = ON` (set in `initSchema`), the parent DELETE throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed` and the entire restore rolls back, leaving `bootstrapFromManifest` consumers without recovery. |
+| Status | **[FIXED M001/S03]** |
+| Fix | Extracted private `clearHierarchyTablesInOrder(db: DbAdapter)` covering all 10 hierarchy tables in FK-safe order (children → parents). Rewired both `restoreManifest` and `clearEngineHierarchy` through the helper under existing `transaction()` wrappers — single source of truth for hierarchy DELETE order. Helper does NOT open its own transaction (caller wraps; honors `_transactionRunner` no-nested-BEGIN invariant). |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/restore-manifest-fk-violation-rolls-back.test.ts` — exercises `bootstrapFromManifest` against a non-empty seeded hierarchy with `PRAGMA foreign_keys=ON`. D004 gate captured: pre-fix throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed`; post-fix passes (5/5). |
+| Order verification | `src/resources/extensions/gsd/tests/clear-hierarchy-tables-in-order.test.ts` — recording-fake `DbAdapter` asserts exact 10-table DELETE order via `assert.deepEqual` on full captured-SQL array (reorder/omit/add all fail). |
+| Fix evidence | `.gsd/milestones/M001/slices/S03/tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
+
+### CRITICAL #2 — `db-migration-steps.ts:435-456` — v22 migration not idempotent
+
+| Field | Value |
+|-------|-------|
+| Original location | `src/resources/extensions/gsd/db-migration-steps.ts:435-456` (`applyMigrationV22QualityGateRepair`) |
+| Issue | Bare `CREATE TABLE quality_gates_new (...)` inside the `if (needsRepair)` block. A partial-then-retry run (Run 1 throws after CREATE succeeds, Run 2 retries) hits `table quality_gates_new already exists` and the v22 migration cannot recover. |
+| Status | **[FIXED M001/S04]** |
+| Fix | Inserted `db.exec("DROP TABLE IF EXISTS quality_gates_new");` as the very first statement inside the `if (needsRepair)` block, immediately preceding the bare CREATE. Chose DROP over `CREATE IF NOT EXISTS` so a leftover staging table from a prior partial run is discarded rather than reused — avoids silent ghost-row leakage via the existing `INSERT OR IGNORE` row-copy hook. |
+| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/db-migration-steps-v22-idempotency.test.ts` — calls `applyMigrationV22QualityGateRepair` directly on the adapter (bypasses `migrateSchema`'s outer BEGIN/ROLLBACK so the bug is observable). Two subtests: (a) Run 1 throws after CREATE succeeds, Run 2 retries with no-op hook; (b) ghost-row guard — seeds a synthetic row into the leftover staging table and asserts the post-fix rebuild discards it (design proof for DROP vs CREATE-IF-NOT-EXISTS). |
+| Audit rule | `rg -n "CREATE TABLE [a-z_]+_new\b" src/**/db-migration*.ts` — every hit must be preceded by `DROP TABLE IF EXISTS` (captured as MEM027 + S04-PATTERN-DRAFT). |
+| Fix evidence | `.gsd/milestones/M001/slices/S04/S04-SUMMARY.md`, `tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
+
+### CRITICAL #3 — `parallel-merge.ts:48` & `parallel-monitor-overlay.ts:135,175` — sqlite3 CLI SQL injection via worktree directory names
 
 | Field | Value |
 |-------|-------|
@@ -167,7 +175,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/parallel-merge-rejects-malicious-worktree-name.test.ts` |
 | Fix evidence | `.gsd/milestones/M001/slices/S01/tasks/T04-SUMMARY.md` (D004 gate) |
 
-## CRITICAL #4 — preferences-models.ts:339,346 — broken regex + non-atomic write
+### CRITICAL #4 — `preferences-models.ts:339,346` — broken regex + non-atomic write
 
 | Field | Value |
 |-------|-------|
@@ -179,19 +187,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/preferences-models-regex-and-atomic-write.test.ts` (9 branch-coverage subtests + 1 rename-failure seam test + 1 five-iteration round-trip behavioral test). D004 gate verified: 6 fails pre-fix → 11/11 pass post-fix. |
 | Fix evidence | `.gsd/milestones/M001/slices/S02/tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
 
-## CRITICAL #1 — gsd-db.ts:2759-2770 — restoreManifest FK violation under PRAGMA foreign_keys=ON
-
-| Field | Value |
-|-------|-------|
-| Original location | `src/resources/extensions/gsd/gsd-db.ts:2759-2770` (`restoreManifest`) |
-| Issue | `restoreManifest()` cleared `milestones`, `slices`, `tasks`, `verification_evidence` directly, leaving FK-bearing children (`quality_gates`, `slice_dependencies`, `replan_history`, `assessments`, `milestone_commit_attributions`, `requirement_coverage`, `gate_results`) untouched. With `PRAGMA foreign_keys = ON` (set in `initSchema`), the parent DELETE throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed` and the entire restore rolls back, leaving `bootstrapFromManifest` consumers without recovery. |
-| Status | **[FIXED M001/S03]** |
-| Fix | Extracted private `clearHierarchyTablesInOrder(db: DbAdapter)` covering all 10 hierarchy tables in FK-safe order (children → parents). Rewired both `restoreManifest` and `clearEngineHierarchy` through the helper under existing `transaction()` wrappers — single source of truth for hierarchy DELETE order. Helper does NOT open its own transaction (caller wraps; honors `_transactionRunner` no-nested-BEGIN invariant). |
-| Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/restore-manifest-fk-violation-rolls-back.test.ts` — exercises `bootstrapFromManifest` against a non-empty seeded hierarchy with `PRAGMA foreign_keys=ON`. D004 gate captured: pre-fix throws `SQLITE_CONSTRAINT: FOREIGN KEY constraint failed`; post-fix passes (5/5). |
-| Order verification | `src/resources/extensions/gsd/tests/clear-hierarchy-tables-in-order.test.ts` — recording-fake DbAdapter asserts exact 10-table DELETE order via `assert.deepEqual` on full captured-SQL array (reorder/omit/add all fail). |
-| Fix evidence | `.gsd/milestones/M001/slices/S03/tasks/T01-SUMMARY.md`, `T02-SUMMARY.md`, `T03-SUMMARY.md` |
-
-## HIGH (S05) — `gsd-db.ts:1591-1605` — setMilestoneQueueOrder raw `BEGIN IMMEDIATE` outside `_transactionRunner`
+### HIGH (S05) — `gsd-db.ts:1591-1605` — `setMilestoneQueueOrder` raw `BEGIN IMMEDIATE` outside `_transactionRunner`
 
 | Field | Value |
 |-------|-------|
@@ -202,7 +198,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/set-milestone-queue-order-uses-transaction-runner.test.ts` (D004 RED/GREEN captured at `.gsd/milestones/M001/slices/S05/tasks/T01-prefix-failure.txt` / `T01-postfix-pass.txt`) |
 | Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T01-SUMMARY.md` |
 
-## HIGH (S05) — `gsd-db.ts:702-715` — vacuumDatabase / checkpointDatabase missing `isInTransaction()` gate
+### HIGH (S05) — `gsd-db.ts:702-715` — `vacuumDatabase` / `checkpointDatabase` missing `isInTransaction()` gate
 
 | Field | Value |
 |-------|-------|
@@ -214,7 +210,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Failure-visibility log | `logWarning('db', 'VACUUM skipped: inside transaction')` / `logWarning('db', 'WAL checkpoint skipped: inside transaction')` — searchable via `rg 'inside transaction' .gsd/activity/` |
 | Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T02-SUMMARY.md` |
 
-## HIGH (S05) — `gsd-db.ts:1793-1794` — ATTACH DATABASE raw template-string interpolation
+### HIGH (S05) — `gsd-db.ts:1793-1794` — `ATTACH DATABASE` raw template-string interpolation
 
 | Field | Value |
 |-------|-------|
@@ -225,7 +221,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/attach-database-rejects-malicious-worktree-path.test.ts` — 11 assertions (validator unit + behavioral D004). Captures at `.gsd/milestones/M001/slices/S05/tasks/T03-prefix-failure.txt` / `T03-postfix-pass.txt`. |
 | Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T03-SUMMARY.md` |
 
-## HIGH (S05) — `db/unit-dispatches.ts:269-271` — markFailed treats `retryAfterMs === 0` as no-retry
+### HIGH (S05) — `db/unit-dispatches.ts:269-271` — `markFailed` treats `retryAfterMs === 0` as no-retry
 
 | Field | Value |
 |-------|-------|
@@ -236,7 +232,7 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/mark-failed-retry-after-ms-zero-retries-immediately.test.ts` (2-case D004 regression: immediate-retry + no-retry path). Captures at `.gsd/milestones/M001/slices/S05/tasks/T04-prefix-failure.txt` / `T04-postfix-pass.txt`. |
 | Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T04-SUMMARY.md` |
 
-## HIGH (S05) — `gsd-db.ts:438-512` — openDatabaseByWorkspace cache TOCTOU on open-failure
+### HIGH (S05) — `gsd-db.ts:438-512` — `openDatabaseByWorkspace` cache TOCTOU on open-failure
 
 | Field | Value |
 |-------|-------|
@@ -247,4 +243,3 @@ CRITICAL #2, and the five S05 HIGH DB-integrity bugs.
 | Reproduce-and-prevent test | `src/resources/extensions/gsd/tests/open-database-by-workspace-cleans-cache-on-open-failure.test.ts` — 3 sub-tests (throw branch + !opened branch with seam-planted stale entry; seam-reset smoke test). Captures at `.gsd/milestones/M001/slices/S05/tasks/T05-prefix-failure.txt` / `T05-postfix-pass.txt`. |
 | Failure-visibility log | `logWarning('db', 'open-failure cache cleanup', { key })` — searchable via `rg 'open-failure cache' .gsd/activity/` |
 | Fix evidence | `.gsd/milestones/M001/slices/S05/tasks/T05-SUMMARY.md` |
->>>>>>> milestone/M001
