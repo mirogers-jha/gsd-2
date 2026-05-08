@@ -1236,44 +1236,42 @@ export const DISPATCH_RULES: DispatchRule[] = [
             "",
             `Milestone validation was skipped via ${skipSource}.`,
           ].join("\n");
-          writeFileSync(validationPath, content, "utf-8");
-          try {
-            // DB-backed state derivation keys off assessments, not only the file
-            // projection. Persist the skipped validation there too so the next
-            // loop iteration advances to completing-milestone instead of
-            // re-entering validating-milestone.
-            if (isDbAvailable()) {
-              transaction(() => {
-                insertAssessment({
-                  path: validationPath,
-                  milestoneId: mid,
-                  sliceId: null,
-                  taskId: null,
-                  status: "pass",
-                  scope: "milestone-validation",
-                  fullContent: content,
-                });
-                const gateSliceId = getMilestoneSlices(mid)[0]?.id;
-                if (gateSliceId) {
-                  insertMilestoneValidationGates(
-                    mid,
-                    gateSliceId,
-                    "pass",
-                    new Date().toISOString(),
-                  );
-                }
+          // DB-first, file-second: matches tools/validate-milestone.ts:121-160.
+          // The inverse order (file-first) leaves orphan VALIDATION.md files
+          // on disk when the transaction throws or the process is killed
+          // mid-write — the file is then visible to dispatch checks but the
+          // assessments row state.ts:569 keys off is missing, wedging the
+          // auto-loop on repeated validate-milestone derives.
+          if (isDbAvailable()) {
+            transaction(() => {
+              insertAssessment({
+                path: validationPath,
+                milestoneId: mid,
+                sliceId: null,
+                taskId: null,
+                status: "pass",
+                scope: "milestone-validation",
+                fullContent: content,
               });
-            }
-          } catch (err) {
-            try {
-              unlinkSync(validationPath);
-            } catch (unlinkErr) {
-              logWarning(
-                "dispatch",
-                `failed to remove skipped validation file after DB write failure for ${mid}: ${unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr)}`,
-              );
-            }
-            throw err;
+              const gateSliceId = getMilestoneSlices(mid)[0]?.id;
+              if (gateSliceId) {
+                insertMilestoneValidationGates(
+                  mid,
+                  gateSliceId,
+                  "pass",
+                  new Date().toISOString(),
+                );
+              }
+            });
+          }
+          try {
+            writeFileSync(validationPath, content, "utf-8");
+          } catch (renderErr) {
+            // DB row is committed; the file is a regenerable projection.
+            logWarning(
+              "dispatch",
+              `skip-validation projection write failed for ${mid}: ${renderErr instanceof Error ? renderErr.message : String(renderErr)}`,
+            );
           }
           invalidateAllCaches();
         }

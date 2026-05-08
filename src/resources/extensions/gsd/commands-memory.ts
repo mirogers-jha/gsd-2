@@ -179,7 +179,7 @@ function usage(): string {
 async function ensureDb(): Promise<void> {
   if (isDbAvailable()) return;
   const { ensureDbOpen } = await import("./bootstrap/dynamic-tools.js");
-  await ensureDbOpen();
+  await ensureDbOpen(projectRoot());
 }
 
 function handleList(ctx: ExtensionCommandContext): void {

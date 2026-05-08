@@ -14,8 +14,10 @@ import { appendEvent } from "./workflow-events.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { clearParseCache } from "./files.js";
 import { parseRoadmap as parseLegacyRoadmap, parsePlan as parseLegacyPlan } from "./parsers-legacy.js";
-import { isDbAvailable, getTask, getSlice, getSliceTasks, getPendingGates, updateTaskStatus, updateSliceStatus, insertSlice, getMilestone, refreshOpenDatabaseFromDisk, getCompletedMilestoneTaskFileHints, getMilestoneCommitAttributionShas, recordMilestoneCommitAttribution } from "./gsd-db.js";
+import { isDbAvailable, getTask, getSlice, getSliceTasks, getPendingGates, updateTaskStatus, updateSliceStatus, insertSlice, getMilestone, refreshOpenDatabaseFromDisk, getCompletedMilestoneTaskFileHints, getMilestoneCommitAttributionShas, recordMilestoneCommitAttribution, transaction, insertAssessment, getMilestoneSlices, getLatestAssessmentByScope } from "./gsd-db.js";
 import { isValidationTerminal } from "./state.js";
+import { extractVerdict, isValidMilestoneVerdict } from "./verdict-parser.js";
+import { insertMilestoneValidationGates } from "./milestone-validation-gates.js";
 import { getErrorMessage } from "./error-utils.js";
 import { logWarning, logError } from "./workflow-logger.js";
 import { readIntegrationBranch } from "./git-service.js";
@@ -74,7 +76,14 @@ export type ArtifactRecoveryDbRefreshResult =
 export function refreshRecoveryDbForArtifact(
   unitType: string,
   unitId: string,
+  base?: string,
 ): ArtifactRecoveryDbRefreshResult {
+  // Reconcile orphan VALIDATION.md files: file present on disk but no
+  // assessments row. state.ts:569 keys off the row, so an orphan wedges
+  // the auto-loop on repeated validate-milestone derives until a hard stop.
+  if (unitType === "validate-milestone") {
+    return reconcileValidateMilestoneOrphan(unitId, base);
+  }
   if (unitType !== "plan-slice" && unitType !== "execute-task") return { ok: true };
   if (!isDbAvailable()) return { ok: true };
 
@@ -119,6 +128,97 @@ export function refreshRecoveryDbForArtifact(
   }
 
   return { ok: true };
+}
+
+/**
+ * Reconcile an orphan milestone VALIDATION.md (file on disk, no assessments
+ * row). Parses the verdict from the file's frontmatter and inserts the
+ * missing assessment + quality-gate rows so the auto-loop can advance past
+ * `validating-milestone`.
+ *
+ * Safe because the file's frontmatter verdict is the authoritative result —
+ * the same content the validate-milestone tool would have written. Mirrors
+ * the skip-validation pathway in auto-dispatch.ts.
+ */
+function reconcileValidateMilestoneOrphan(
+  unitId: string,
+  base: string | undefined,
+): ArtifactRecoveryDbRefreshResult {
+  if (!isDbAvailable()) return { ok: true };
+  if (!base) return { ok: true };
+
+  if (!refreshOpenDatabaseFromDisk()) {
+    return {
+      ok: false,
+      fatal: false,
+      reason: "validate-milestone-db-refresh-failed",
+      message: `Stuck recovery found ${unitId} validation file, but the DB refresh failed.`,
+    };
+  }
+
+  const { milestone: mid } = parseUnitId(unitId);
+  if (!mid) {
+    return {
+      ok: false,
+      fatal: true,
+      reason: "validate-milestone-invalid-unit-id",
+      message: `Could not parse milestone id from ${unitId}.`,
+    };
+  }
+
+  // Assessment row already present — nothing to reconcile.
+  if (getLatestAssessmentByScope(mid, "milestone-validation")?.status) {
+    return { ok: true };
+  }
+
+  const validationPath = resolveExpectedArtifactPath("validate-milestone", unitId, base);
+  if (!validationPath || !existsSync(validationPath)) return { ok: true };
+
+  const content = readFileSync(validationPath, "utf-8");
+  const verdict = extractVerdict(content);
+  if (!verdict || !isValidMilestoneVerdict(verdict)) {
+    return {
+      ok: false,
+      fatal: true,
+      reason: "validate-milestone-orphan-unparseable",
+      message: `Validation file at ${validationPath} has no parseable verdict; cannot reconcile.`,
+    };
+  }
+
+  try {
+    transaction(() => {
+      insertAssessment({
+        path: validationPath,
+        milestoneId: mid,
+        sliceId: null,
+        taskId: null,
+        status: verdict,
+        scope: "milestone-validation",
+        fullContent: content,
+      });
+      const gateSliceId = getMilestoneSlices(mid)[0]?.id;
+      if (gateSliceId) {
+        insertMilestoneValidationGates(
+          mid,
+          gateSliceId,
+          verdict,
+          new Date().toISOString(),
+        );
+      }
+    });
+    logWarning(
+      "recovery",
+      `Reconciled orphan validation file for ${mid} with verdict=${verdict}`,
+    );
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      fatal: false,
+      reason: "validate-milestone-reconcile-failed",
+      message: `Failed to reconcile orphan validation file for ${mid}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 function hasCapturedWorkflowPrefs(base: string): boolean {

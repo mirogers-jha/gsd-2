@@ -3,6 +3,7 @@
 
 import { AMAZON_BEDROCK_MODELS } from "./amazon-bedrock.js";
 import { ANTHROPIC_MODELS } from "./anthropic.js";
+import { ANTHROPIC_VERTEX_MODELS } from "./anthropic-vertex.js";
 import { AZURE_OPENAI_RESPONSES_MODELS } from "./azure-openai-responses.js";
 import { CEREBRAS_MODELS } from "./cerebras.js";
 import { GITHUB_COPILOT_MODELS } from "./github-copilot.js";
@@ -28,6 +29,7 @@ import { ZAI_MODELS } from "./zai.js";
 export const MODELS = {
 	"amazon-bedrock": AMAZON_BEDROCK_MODELS,
 	"anthropic": ANTHROPIC_MODELS,
+	"anthropic-vertex": ANTHROPIC_VERTEX_MODELS,
 	"azure-openai-responses": AZURE_OPENAI_RESPONSES_MODELS,
 	"cerebras": CEREBRAS_MODELS,
 	"github-copilot": GITHUB_COPILOT_MODELS,

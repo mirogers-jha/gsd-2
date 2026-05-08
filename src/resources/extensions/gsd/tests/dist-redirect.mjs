@@ -34,7 +34,15 @@ export function resolve(specifier, context, nextResolve) {
   //    Also handles local imports — skip rewrite for dist/ paths that are real compiled artifacts.
 
   else if (specifier.endsWith('.js') && (specifier.startsWith('./') || specifier.startsWith('../'))) {
-    if (context.parentURL && context.parentURL.includes('/src/')) {
+    // Only rewrite imports originating from workspace source — never from
+    // node_modules. The `/src/` substring check is ambiguous when the project
+    // root itself sits under a path containing `/src/` (e.g. `~/src/...`),
+    // which makes every node_modules file appear to be workspace source.
+    if (
+      context.parentURL &&
+      context.parentURL.includes('/src/') &&
+      !context.parentURL.includes('/node_modules/')
+    ) {
       if (specifier.includes('/dist/')) {
         specifier = specifier.replace('/dist/', '/src/').replace(/\.js$/, '.ts');
       } else {

@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 
 import { verifyExpectedArtifact, hasImplementationArtifacts, resolveExpectedArtifactPath, diagnoseExpectedArtifact, buildLoopRemediationSteps, writeBlockerPlaceholder, refreshRecoveryDbForArtifact } from "../auto-recovery.ts";
 import { resolveMilestoneFile } from "../paths.ts";
-import { openDatabase, closeDatabase, insertMilestone, insertSlice, insertGateRow, insertTask, getMilestoneCommitAttributionShas } from "../gsd-db.ts";
+import { openDatabase, closeDatabase, insertMilestone, insertSlice, insertGateRow, insertTask, getMilestoneCommitAttributionShas, getLatestAssessmentByScope } from "../gsd-db.ts";
 import { clearParseCache } from "../files.ts";
 import { parseRoadmap } from "../parsers-legacy.ts";
 import { invalidateAllCaches } from "../cache.ts";
@@ -186,6 +186,68 @@ test("refreshRecoveryDbForArtifact treats missing execute-task DB rows as fatal 
     reason: "execute-task-artifact-db-missing",
     message: "Stuck recovery found execute-task M001/S01/T01 artifacts, but no matching DB task row exists after refresh.",
   });
+});
+
+test("refreshRecoveryDbForArtifact reconciles orphan validate-milestone file into assessments row", () => {
+  const dir = makeTmpProject();
+  const milestoneDir = join(dir, ".gsd", "milestones", "M001");
+  mkdirSync(milestoneDir, { recursive: true });
+  const validationPath = join(milestoneDir, "M001-VALIDATION.md");
+  writeFileSync(
+    validationPath,
+    [
+      "---",
+      "verdict: pass",
+      "remediation_round: 0",
+      "---",
+      "",
+      "# Milestone Validation: M001",
+      "",
+      "Pass.",
+    ].join("\n"),
+    "utf-8",
+  );
+
+  // Sanity: DB has no assessment yet.
+  assert.equal(getLatestAssessmentByScope("M001", "milestone-validation"), null);
+
+  const result = refreshRecoveryDbForArtifact("validate-milestone", "M001", dir);
+  assert.deepEqual(result, { ok: true });
+
+  const row = getLatestAssessmentByScope("M001", "milestone-validation");
+  assert.ok(row, "assessment row should be inserted");
+  assert.equal((row as { status: string }).status, "pass");
+});
+
+test("refreshRecoveryDbForArtifact returns fatal for unparseable orphan validate-milestone file", () => {
+  const dir = makeTmpProject();
+  const milestoneDir = join(dir, ".gsd", "milestones", "M001");
+  mkdirSync(milestoneDir, { recursive: true });
+  const validationPath = join(milestoneDir, "M001-VALIDATION.md");
+  writeFileSync(validationPath, "# Milestone Validation: M001\n\nNo frontmatter here.\n", "utf-8");
+
+  const result = refreshRecoveryDbForArtifact("validate-milestone", "M001", dir);
+  assert.equal(result.ok, false);
+  assert.equal((result as { fatal: boolean }).fatal, true);
+  assert.equal((result as { reason: string }).reason, "validate-milestone-orphan-unparseable");
+});
+
+test("refreshRecoveryDbForArtifact is a no-op when validate-milestone assessment row already exists", () => {
+  const dir = makeTmpProject();
+  const milestoneDir = join(dir, ".gsd", "milestones", "M001");
+  mkdirSync(milestoneDir, { recursive: true });
+  const validationPath = join(milestoneDir, "M001-VALIDATION.md");
+  const content = "---\nverdict: pass\n---\n# M001\n";
+  writeFileSync(validationPath, content, "utf-8");
+
+  // First call: reconciles
+  refreshRecoveryDbForArtifact("validate-milestone", "M001", dir);
+  const before = getLatestAssessmentByScope("M001", "milestone-validation");
+  assert.ok(before);
+
+  // Second call: no-op (already present)
+  const result = refreshRecoveryDbForArtifact("validate-milestone", "M001", dir);
+  assert.deepEqual(result, { ok: true });
 });
 
 // ─── diagnoseExpectedArtifact ─────────────────────────────────────────────

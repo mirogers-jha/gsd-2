@@ -1129,7 +1129,7 @@ export async function runDispatch(
             level: 1,
             action: "artifact-found",
           });
-          const recoveryDb = refreshRecoveryDbForArtifact(unitType, unitId);
+          const recoveryDb = refreshRecoveryDbForArtifact(unitType, unitId, s.basePath);
           if (!recoveryDb.ok) {
             ctx.ui.notify(
               recoveryDb.fatal
@@ -1171,7 +1171,7 @@ export async function runDispatch(
             level: 2,
             action: "artifact-found",
           });
-          const recoveryDb = refreshRecoveryDbForArtifact(unitType, unitId);
+          const recoveryDb = refreshRecoveryDbForArtifact(unitType, unitId, s.basePath);
           if (recoveryDb.ok) {
             ctx.ui.notify(
               `Stuck recovery: artifact for ${unitType} ${unitId} found on disk after cache invalidation. Continuing.`,
