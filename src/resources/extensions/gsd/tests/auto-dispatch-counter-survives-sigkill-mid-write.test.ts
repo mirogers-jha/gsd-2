@@ -37,11 +37,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -62,7 +62,15 @@ function buildChildScript(target: "rewrite" | "uat", project: string): string {
   // This file at runtime lives at dist-test/resources/extensions/gsd/tests/...
   // The compiled siblings are in the same directory.
   const distDir = __dirname;
-  const autoDispatchPath = join(distDir, "..", "auto-dispatch.js");
+  // Resolve auto-dispatch by trying compiled .js first (test:unit:compiled
+  // path runs from dist-test/), then .ts (test:coverage runs from src/ via
+  // --experimental-strip-types). Both are valid module identifiers Node can
+  // load — the .ts variant requires Node ≥22 + --experimental-strip-types,
+  // which is the project baseline. The caller adjusts child spawn args
+  // accordingly via childSpawnArgs() below.
+  const autoDispatchJs = join(distDir, "..", "auto-dispatch.js");
+  const autoDispatchTs = join(distDir, "..", "auto-dispatch.ts");
+  const autoDispatchPath = existsSync(autoDispatchJs) ? autoDispatchJs : autoDispatchTs;
   const escape = (p: string) => p.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
   const callExpression =
@@ -98,6 +106,33 @@ function buildChildScript(target: "rewrite" | "uat", project: string): string {
   `;
 }
 
+/**
+ * Build child Node spawn args. When auto-dispatch is loaded from .ts (the
+ * `test:coverage` source-strip path), the child needs `--experimental-strip-types`
+ * to import it — otherwise Node throws ERR_MODULE_NOT_FOUND for the .ts URL.
+ * Under `test:unit:compiled` we load .js and no extra flag is needed.
+ */
+function childSpawnArgs(script: string): string[] {
+  const distDir = __dirname;
+  const usingTs = !existsSync(join(distDir, "..", "auto-dispatch.js"));
+  if (usingTs) {
+    // test:coverage path: source-strip the .ts module and apply the same
+    // .js→.ts resolver hook the parent test runner uses, so internal imports
+    // like `./files.js` resolve to the .ts sibling.
+    const resolverHook = join(distDir, "resolve-ts.mjs");
+    return [
+      "--import",
+      pathToFileURL(resolverHook).href,
+      "--experimental-strip-types",
+      "--input-type=module",
+      "-e",
+      script,
+    ];
+  }
+  // test:unit:compiled path: load the .js sibling directly, no extra hooks.
+  return ["--input-type=module", "-e", script];
+}
+
 function makeProject(): string {
   // realpath: gsdRoot() canonicalizes via realpathSync. On macOS the tmpdir
   // /var symlinks to /private/var; the child process resolves the same
@@ -121,7 +156,7 @@ test("setRewriteCount — SIGKILL between temp-write and rename leaves seed coun
     // structured result we can introspect.
     const result = spawnSync(
       process.execPath,
-      ["--input-type=module", "-e", script],
+      childSpawnArgs(script),
       { encoding: "utf-8", timeout: 10_000 },
     );
 
@@ -176,7 +211,7 @@ test("incrementUatCount — SIGKILL between temp-write and rename leaves seed co
     const script = buildChildScript("uat", project);
     const result = spawnSync(
       process.execPath,
-      ["--input-type=module", "-e", script],
+      childSpawnArgs(script),
       { encoding: "utf-8", timeout: 10_000 },
     );
 
