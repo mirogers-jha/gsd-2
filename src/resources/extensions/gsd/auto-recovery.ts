@@ -1047,55 +1047,104 @@ export function writeBlockerPlaceholder(
   ].join("\n");
   writeFileSync(absPath, content, "utf-8");
 
+  // M002/S03/T04: Mark the task/slice as complete in the DB so
+  // verifyExpectedArtifact passes — wrapped in a single transaction() so
+  // a partial failure rolls back the entire DB-side state instead of
+  // leaving the placeholder file orphaned next to half-applied DB rows
+  // (the pre-fix bug: subsequent recovery attempts cannot re-fire because
+  // the placeholder file already exists).
+  //
+  // Capture FS pre-state for the plan-file `[ ]→[x]` rewrite BEFORE the
+  // transaction so the catch can restore it on rollback.
+  if (isDbAvailable()) {
+    const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
+    const ts = new Date().toISOString();
+
+    let planPath: string | null = null;
+    let originalPlanContent: string | null = null;
+    if (unitType === "execute-task" && mid && sid && tid) {
+      const resolved = resolveSliceFile(base, mid, sid, "PLAN");
+      if (resolved && existsSync(resolved)) {
+        planPath = resolved;
+        originalPlanContent = readFileSync(resolved, "utf-8");
+      }
+    }
+
+    try {
+      // The transaction() runner is depth-tracked (db-transaction.ts):
+      // calling from inside an outer transaction safely runs the body
+      // without nesting BEGIN/COMMIT. None of the 3 production callers
+      // (auto-post-unit.ts:1066, auto-timeout-recovery.ts:139,:281) are
+      // currently inside a transaction at call time (D003 cousin audit),
+      // but the runner handles nesting defensively if that ever changes.
+      transaction(() => {
+        if (unitType === "execute-task" && mid && sid && tid) {
+          updateTaskStatus(mid, sid, tid, "complete", ts);
+          // Append event so worktree reconciliation can replay this recovery completion
+          appendEvent(base, { cmd: "complete-task", params: { milestoneId: mid, sliceId: sid, taskId: tid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" });
+          // Plan-file rewrite lives INSIDE the txn body so a later DB op
+          // (appendEvent) throwing skips the plan rewrite entirely. If
+          // an EARLIER DB op (updateTaskStatus) throws, this never runs.
+          // If a LATER DB op throws after this rewrite happened, the
+          // outer catch restores the plan from `originalPlanContent`.
+          if (planPath !== null && originalPlanContent !== null) {
+            const updatedPlan = originalPlanContent.replace(
+              new RegExp(`^(\\s*-\\s+)\\[ \\]\\s+\\*\\*${tid}:`, "m"),
+              `$1[x] **${tid}:`,
+            );
+            if (updatedPlan !== originalPlanContent) {
+              atomicWriteSync(planPath, updatedPlan);
+            }
+          }
+        }
+        if (unitType === "complete-slice" && mid && sid) {
+          updateSliceStatus(mid, sid, "complete", ts);
+          appendEvent(base, { cmd: "complete-slice", params: { milestoneId: mid, sliceId: sid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" });
+        }
+        // Insert a placeholder complete slice so deriveState sees activeMilestoneSlices.length > 0
+        // and exits the pre-planning phase. Without this, activeMilestoneSlices stays empty
+        // after the blocker ROADMAP.md is written, causing deriveState to return phase:'pre-planning'
+        // indefinitely and re-dispatching plan-milestone in an infinite loop (#4378).
+        if (unitType === "plan-milestone" && mid) {
+          insertSlice({ id: "S00-blocker", milestoneId: mid, title: "Blocker placeholder — planning failed", status: "complete", sequence: 0 });
+          appendEvent(base, { cmd: "plan-milestone", params: { milestoneId: mid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" });
+        }
+      });
+    } catch (e) {
+      // M002/S03/T04: FS rollback. The transaction() runner already rolled
+      // back the DB; mirror it on the FS so the next dispatch attempt can
+      // re-fire (no orphan placeholder, original plan-file contents).
+      try {
+        if (existsSync(absPath)) unlinkSync(absPath);
+      } catch (e2) {
+        logWarning("recovery", `writeBlockerPlaceholder rollback unlink failed: ${e2 instanceof Error ? e2.message : String(e2)}`);
+      }
+      if (planPath !== null && originalPlanContent !== null) {
+        try {
+          atomicWriteSync(planPath, originalPlanContent);
+        } catch (e2) {
+          logWarning("recovery", `writeBlockerPlaceholder rollback plan-file restore failed: ${e2 instanceof Error ? e2.message : String(e2)}`);
+        }
+      }
+      logWarning("recovery", `writeBlockerPlaceholder transaction failed; FS rollback applied: ${e instanceof Error ? e.message : String(e)}`);
+      throw e;
+    }
+  }
+
   // #4414: Clear caches so subsequent dispatch guards (e.g.
   // resolveMilestoneFile) see the placeholder file. Without this, the
   // cached directory listing is stale and the dispatch rule re-fires,
   // producing an infinite loop despite the placeholder being on disk.
   // Matches the pattern used in verifyExpectedArtifact above.
+  //
+  // M002/S03/T04: Cache invalidation runs OUTSIDE the transaction. Cache
+  // misses are recoverable on next read; cache-clear inside a txn would
+  // orphan invalidations on rollback (cache cleared but DB/FS state
+  // restored to pre-call). Do not move into transaction(). On rollback
+  // we re-throw above, so this line is skipped — leaving the cache
+  // unchanged matches the unwritten-placeholder FS state.
   clearPathCache();
   clearParseCache();
-
-  // Mark the task/slice as complete in the DB so verifyExpectedArtifact passes.
-  // Without this, the DB status stays "pending" and the dispatch loop
-  // re-derives the same unit indefinitely (#2531, #2653).
-  if (isDbAvailable()) {
-    const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
-    const ts = new Date().toISOString();
-    if (unitType === "execute-task" && mid && sid && tid) {
-      try {
-        updateTaskStatus(mid, sid, tid, "complete", ts);
-        const planPath = resolveSliceFile(base, mid, sid, "PLAN");
-        if (planPath && existsSync(planPath)) {
-          const planContent = readFileSync(planPath, "utf-8");
-          const updatedPlan = planContent.replace(
-            new RegExp(`^(\\s*-\\s+)\\[ \\]\\s+\\*\\*${tid}:`, "m"),
-            `$1[x] **${tid}:`,
-          );
-          if (updatedPlan !== planContent) {
-            atomicWriteSync(planPath, updatedPlan);
-          }
-        }
-      } catch (e) {
-        logWarning("recovery", `updateTaskStatus failed during context exhaustion: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      // Append event so worktree reconciliation can replay this recovery completion
-      try { appendEvent(base, { cmd: "complete-task", params: { milestoneId: mid, sliceId: sid, taskId: tid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for task recovery: ${e instanceof Error ? e.message : String(e)}`); }
-    }
-    if (unitType === "complete-slice" && mid && sid) {
-      try { updateSliceStatus(mid, sid, "complete", ts); } catch (e) { logWarning("recovery", `updateSliceStatus failed during context exhaustion: ${e instanceof Error ? e.message : String(e)}`); }
-      try { appendEvent(base, { cmd: "complete-slice", params: { milestoneId: mid, sliceId: sid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for slice recovery: ${e instanceof Error ? e.message : String(e)}`); }
-    }
-    // Insert a placeholder complete slice so deriveState sees activeMilestoneSlices.length > 0
-    // and exits the pre-planning phase. Without this, activeMilestoneSlices stays empty
-    // after the blocker ROADMAP.md is written, causing deriveState to return phase:'pre-planning'
-    // indefinitely and re-dispatching plan-milestone in an infinite loop (#4378).
-    if (unitType === "plan-milestone" && mid) {
-      try {
-        insertSlice({ id: "S00-blocker", milestoneId: mid, title: "Blocker placeholder — planning failed", status: "complete", sequence: 0 });
-      } catch (e) { logWarning("recovery", `insertSlice placeholder failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
-      try { appendEvent(base, { cmd: "plan-milestone", params: { milestoneId: mid }, ts, actor: "system", trigger_reason: "blocker-placeholder-recovery" }); } catch (e) { logWarning("recovery", `appendEvent failed for plan-milestone recovery: ${e instanceof Error ? e.message : String(e)}`); }
-    }
-  }
 
   return diagnoseExpectedArtifact(unitType, unitId, base);
 }

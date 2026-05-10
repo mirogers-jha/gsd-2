@@ -1386,7 +1386,19 @@ export function insertTask(t: {
   });
 }
 
-export function updateTaskStatus(milestoneId: string, sliceId: string, taskId: string, status: string, completedAt?: string): void {
+/**
+ * Default `updateTaskStatus` implementation. Tests may swap this out via
+ * `_setUpdateTaskStatusForTests` to inject a throwing or counting impl
+ * without round-tripping through the call site (D005 seam-injection,
+ * MEM036). Used by M002/S03/T04 to deterministically force a mid-txn
+ * failure inside `writeBlockerPlaceholder` so the FS rollback path can
+ * be unit-tested without resorting to schema corruption mid-flight.
+ *
+ * Pattern mirrors `_setOpenDatabaseForTests` at gsd-db.ts:460.
+ */
+type UpdateTaskStatusFn = (milestoneId: string, sliceId: string, taskId: string, status: string, completedAt?: string) => void;
+
+function defaultUpdateTaskStatus(milestoneId: string, sliceId: string, taskId: string, status: string, completedAt?: string): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
   currentDb.prepare(
     `UPDATE tasks SET status = :status, completed_at = :completed_at
@@ -1398,6 +1410,22 @@ export function updateTaskStatus(milestoneId: string, sliceId: string, taskId: s
     ":slice_id": sliceId,
     ":id": taskId,
   });
+}
+
+let _activeUpdateTaskStatus: UpdateTaskStatusFn = defaultUpdateTaskStatus;
+
+/**
+ * Test-only seam. Pass an impl to install it; pass `null` to reset to
+ * `defaultUpdateTaskStatus`. Underscore-prefixed to signal "not for
+ * production use". See M002/S03/T04 for the writeBlockerPlaceholder
+ * transactional rollback regression test that exercises this seam.
+ */
+export function _setUpdateTaskStatusForTests(impl: UpdateTaskStatusFn | null): void {
+  _activeUpdateTaskStatus = impl ?? defaultUpdateTaskStatus;
+}
+
+export function updateTaskStatus(milestoneId: string, sliceId: string, taskId: string, status: string, completedAt?: string): void {
+  _activeUpdateTaskStatus(milestoneId, sliceId, taskId, status, completedAt);
 }
 
 export function setTaskBlockerDiscovered(milestoneId: string, sliceId: string, taskId: string, discovered: boolean): void {
