@@ -16,6 +16,7 @@ import {
   _consumePendingSwitchCancellation,
   _setCurrentResolve,
   _setSessionSwitchInFlight,
+  isSessionSwitchInFlight,
 } from "./resolve.js";
 import {
   getCurrentTurnGeneration,
@@ -29,6 +30,61 @@ import { formatAutoUnitWorkingMessage } from "../working-output-messages.js";
 // Tracks the latest session-switch attempt so a late timeout settlement from an
 // older runUnit() call cannot clear the guard for a newer one.
 let sessionSwitchGeneration = 0;
+
+// ─── Agent-end-dispatcher seam (M002/S04/T01) ───────────────────────────────
+//
+// Test-only injection point for the `s.cmdCtx!.newSession({...})` boundary —
+// the only awaitable call between `_setSessionSwitchInFlight(true)` and the
+// chained `.finally()` flag-clearer that a deterministic test can poison.
+//
+// Production code MUST read `activeAgentEndDispatcher` on every call (no
+// `const x = activeAgentEndDispatcher` closure capture). The plan-time grep
+// gate at S04-RESEARCH §"Seam install-order structural guarantee" enforces
+// this; the source-guard subtest in
+// `tests/auto-run-unit-flag-cleared-on-synthetic-throw.test.ts` re-asserts
+// it. Pattern mirrors `parallel-sqlite-cli.ts:_setSqliteRunnerForTests` and
+// `gsd-db.ts:_setOpenDatabaseForTests`.
+//
+// Why this signature: the seam wraps the new-session call shape that
+// `s.cmdCtx!.newSession({...})` would otherwise dispatch directly. The
+// dispatcher returns a Promise that resolves to whatever `newSession`
+// resolves to (typed as `unknown` here because the new-session return type
+// is opaque to this module — the only consumer is the `.finally()` chain
+// and the `await Promise.race(...)` result drop).
+type AgentEndDispatcherCmdCtx = {
+  newSession: (opts: {
+    abortSignal: AbortSignal;
+    cwd: string;
+  }) => Promise<{ cancelled: boolean }>;
+};
+type AgentEndDispatcherFn = (
+  cmdCtx: AgentEndDispatcherCmdCtx,
+  opts: { abortSignal: AbortSignal; cwd: string },
+) => Promise<{ cancelled: boolean }>;
+
+const defaultAgentEndDispatcher: AgentEndDispatcherFn = (cmdCtx, opts) =>
+  cmdCtx.newSession(opts);
+
+let activeAgentEndDispatcher: AgentEndDispatcherFn = defaultAgentEndDispatcher;
+
+/**
+ * Test-only seam (M002/S04/T01). Pass an impl to install it; pass `null` to
+ * reset to the default. Underscore-prefixed to signal "not for production
+ * use". Mirrors `_setSqliteRunnerForTests` and `_setOpenDatabaseForTests`.
+ */
+export function _setAgentEndDispatcherForTests(
+  impl: AgentEndDispatcherFn | null,
+): void {
+  activeAgentEndDispatcher = impl ?? defaultAgentEndDispatcher;
+}
+
+/**
+ * Reset the seam to the default impl. Always call from `afterEach` so
+ * subsequent tests are not contaminated.
+ */
+export function _resetAgentEndDispatcherForTests(): void {
+  activeAgentEndDispatcher = defaultAgentEndDispatcher;
+}
 
 /**
  * Execute a single unit: create a new session, send the prompt, and await
@@ -83,38 +139,73 @@ export async function runUnit(
   // it from capturing the (now-root) process.cwd() and rebuilding the tool
   // runtime with the wrong cwd.
   const sessionAbortController = new AbortController();
-  _setSessionSwitchInFlight(true);
+  // _setAgentEndDispatcherForTests envelope (M002/S04/T01 — D011 hardening per
+  // RESEARCH §T01). Pre-fix `_setSessionSwitchInFlight(true)` lived OUTSIDE the
+  // try block (between `++sessionSwitchGeneration` and `try {`). Neither `let`
+  // declarations nor numeric `++` can throw synchronously in current Node so
+  // the bug is theoretical-only — but the seam allows tests to inject a
+  // synchronous throw at the dispatcher boundary, exercising the same recovery
+  // path. The outer `let switchFlagThrew` + finally branch clears the flag
+  // when `activeAgentEndDispatcher(...)` throws BEFORE constructing the
+  // sessionPromise (its chained `.finally()` would otherwise be the only
+  // clearer). Pattern mirrors M002/S04/T05 (auto/phases.ts) try/finally
+  // envelope.
+  let switchFlagThrew = true;
   try {
-    const sessionPromise = s.cmdCtx!.newSession({
-      abortSignal: sessionAbortController.signal,
-      cwd: s.basePath,
-    }).finally(() => {
-      if (sessionSwitchGeneration === mySessionSwitchGeneration) {
-        _setSessionSwitchInFlight(false);
-      }
-    });
-    const timeoutPromise = new Promise<{ cancelled: true }>((resolve) => {
-      sessionTimeoutHandle = setTimeout(
-        () => {
-          sessionAbortController.abort();
-          resolve({ cancelled: true });
-        },
-        NEW_SESSION_TIMEOUT_MS,
+    _setSessionSwitchInFlight(true);
+    try {
+      const sessionPromise = activeAgentEndDispatcher(s.cmdCtx!, {
+        abortSignal: sessionAbortController.signal,
+        cwd: s.basePath,
+      }).finally(() => {
+        if (sessionSwitchGeneration === mySessionSwitchGeneration) {
+          _setSessionSwitchInFlight(false);
+        }
+      });
+      const timeoutPromise = new Promise<{ cancelled: true }>((resolve) => {
+        sessionTimeoutHandle = setTimeout(
+          () => {
+            sessionAbortController.abort();
+            resolve({ cancelled: true });
+          },
+          NEW_SESSION_TIMEOUT_MS,
+        );
+      });
+      sessionResult = await Promise.race([sessionPromise, timeoutPromise]);
+    } catch (sessionErr) {
+      if (sessionTimeoutHandle) clearTimeout(sessionTimeoutHandle);
+      _consumePendingSwitchCancellation();
+      const msg =
+        sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
+      debugLog("runUnit", {
+        phase: "session-error",
+        unitType,
+        unitId,
+        error: msg,
+      });
+      // NOTE: do NOT set switchFlagThrew = false here. If the dispatcher
+      // threw synchronously the sessionPromise was never constructed and
+      // the chained `.finally()` did not clear the flag. The outer finally
+      // branch's `isSessionSwitchInFlight()` guard will detect that case
+      // and clear the flag with a recovery-branch warning. If sessionPromise
+      // WAS constructed and rejected, its chained `.finally()` already
+      // cleared the flag so the outer guard skips silently.
+      return { status: "cancelled", errorContext: { message: `Session creation failed: ${msg}`, category: "session-failed", isTransient: true } };
+    }
+    switchFlagThrew = false;
+  } finally {
+    if (
+      switchFlagThrew &&
+      sessionSwitchGeneration === mySessionSwitchGeneration &&
+      isSessionSwitchInFlight()
+    ) {
+      logWarning(
+        "safety",
+        "_setAgentEndDispatcherForTests envelope: session-switch flag still true after throw — recovery branch fired",
+        { unitType, unitId },
       );
-    });
-    sessionResult = await Promise.race([sessionPromise, timeoutPromise]);
-  } catch (sessionErr) {
-    if (sessionTimeoutHandle) clearTimeout(sessionTimeoutHandle);
-    _consumePendingSwitchCancellation();
-    const msg =
-      sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
-    debugLog("runUnit", {
-      phase: "session-error",
-      unitType,
-      unitId,
-      error: msg,
-    });
-    return { status: "cancelled", errorContext: { message: `Session creation failed: ${msg}`, category: "session-failed", isTransient: true } };
+      _setSessionSwitchInFlight(false);
+    }
   }
   if (sessionTimeoutHandle) clearTimeout(sessionTimeoutHandle);
 
