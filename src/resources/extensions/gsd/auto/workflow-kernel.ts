@@ -260,6 +260,71 @@ export function decideDispatchClaim(input: DispatchClaimInput): DispatchClaimDec
   };
 }
 
+// ─── Dispatch-skip diagnostic (Bug B2 — observability) ─────────────────────
+
+export interface DispatchSkipDiagnosticInput {
+  unitType: string;
+  unitId: string;
+  reason: "already-active" | "stale-lease" | string;
+  /** Existing dispatch row id when reason='already-active'. */
+  existingDispatchId?: number;
+  /** Worker id holding the existing dispatch when reason='already-active'. */
+  existingWorker?: string;
+}
+
+export interface DispatchSkipDiagnostic {
+  /** User-facing notification message (warning level). */
+  message: string;
+  /** Structured payload for the `dispatch-skip` journal event. */
+  journalPayload: Record<string, unknown>;
+}
+
+/**
+ * Build a structured diagnostic for a silent dispatch-claim skip.
+ *
+ * Pre-fix the loop.ts dispatch-skip branch logged nothing — no journal
+ * event, no user notification. The user saw `iteration-start →
+ * dispatch-match → ø` for N iterations, then a misleading
+ * "derived 3 consecutive times without progress" stuck verdict. This
+ * helper produces both surfaces from one call so the loop can stay
+ * thin (one if-block emits both).
+ *
+ * Pure function — no side effects, no I/O. Tests against the helper
+ * cover the message contract directly without bringing up the full
+ * auto-mode loop.
+ */
+export function buildDispatchSkipDiagnostic(
+  input: DispatchSkipDiagnosticInput,
+): DispatchSkipDiagnostic {
+  const { unitType, unitId, reason, existingDispatchId, existingWorker } = input;
+
+  const journalPayload: Record<string, unknown> = {
+    unitType,
+    unitId,
+    reason,
+  };
+  if (existingDispatchId !== undefined) {
+    journalPayload.existingDispatchId = existingDispatchId;
+  }
+  if (existingWorker !== undefined) {
+    journalPayload.existingWorker = existingWorker;
+  }
+
+  const parts = [`Dispatch ${unitType} ${unitId} skipped (${reason}).`];
+  if (reason === "already-active") {
+    parts.push(
+      "Another worker holds an active dispatch row for this unit_id. " +
+      "If that worker crashed, run /gsd doctor to release stale claims.",
+    );
+    if (existingWorker) parts.push(`Active worker: ${existingWorker}.`);
+    if (existingDispatchId !== undefined) parts.push(`Existing dispatch row: ${existingDispatchId}.`);
+  } else if (reason === "stale-lease") {
+    parts.push("Milestone lease changed mid-iteration; re-run /gsd auto to re-acquire.");
+  }
+
+  return { message: parts.join(" "), journalPayload };
+}
+
 export function decideEngineDispatch(input: EngineDispatchInput): EngineDispatchDecision {
   if (input.action === "stop") {
     return {

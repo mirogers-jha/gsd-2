@@ -35,6 +35,7 @@ export type JournalEventType =
   | "iteration-start"
   | "dispatch-match"
   | "dispatch-stop"
+  | "dispatch-skip"
   | "pre-dispatch-hook"
   | "unit-start"
   | "unit-end"

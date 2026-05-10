@@ -45,6 +45,7 @@ import { resolveUokFlags } from "../uok/flags.js";
 import { scheduleSidecarQueue } from "../uok/execution-graph.js";
 import { normalizeRealPath } from "../paths.js";
 import {
+  buildDispatchSkipDiagnostic,
   decideCooldownRecovery,
   decideDispatchClaim,
   decideEngineDispatch,
@@ -722,6 +723,37 @@ export async function autoLoop(
             : { kind: "degraded" },
       );
       if (dispatchDecision.action === "skip") {
+        // Bug B2 — silent dispatch-skip observability gap.
+        //
+        // Pre-fix this branch did `finishTurn("skipped"); continue;` with no
+        // journal event and no UI notification. Combined with Bug B1 (crash
+        // recovery leaving stuck `running` rows), the user saw the loop
+        // burn through iterations with `iteration-start → dispatch-match →
+        // ø` and zero diagnostic, eventually tripping the "derived 3
+        // consecutive times without progress" stuck guard with the wrong
+        // root cause.
+        //
+        // Post-fix delegates message + payload construction to the pure
+        // helper `buildDispatchSkipDiagnostic` (testable in isolation), then
+        // emits a structured `dispatch-skip` journal event and a user-facing
+        // notification.
+        const diagnostic = buildDispatchSkipDiagnostic({
+          unitType: iterData.unitType,
+          unitId: iterData.unitId,
+          reason: dispatchDecision.reason,
+          existingDispatchId:
+            dispatchClaim.kind === "skip" ? dispatchClaim.existingId : undefined,
+          existingWorker:
+            dispatchClaim.kind === "skip" ? dispatchClaim.existingWorker : undefined,
+        });
+        deps.emitJournalEvent({
+          ts: new Date().toISOString(),
+          flowId,
+          seq: nextSeq(),
+          eventType: "dispatch-skip",
+          data: diagnostic.journalPayload,
+        });
+        ctx.ui.notify(diagnostic.message, "warning");
         finishTurn("skipped", "execution", dispatchDecision.reason);
         continue;
       }
