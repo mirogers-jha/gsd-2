@@ -1903,6 +1903,14 @@ export function mergeMilestoneToMain(
   }
 
   let stashed = false;
+  // M002/S03/T03 — D011/MEM044 hardening flag: tracks whether the stash entry
+  // has already been "dealt with" (popped or actively managed) by one of the
+  // happy-path call sites or existing throw arms. The defense-in-depth
+  // try/finally envelope below uses this to AVOID double-popping the stash.
+  // Set immediately after each existing popStashByRef call so the finally
+  // remains additive insurance for any FUTURE throw inserted between the
+  // last cleanup and the end of the squash-merge block.
+  let stashPopped = false;
   // Embed a unique marker in the stash message so subsequent pop/drop targets
   // the entry we created, not whatever happens to be at stash@{0} (concurrent
   // milestone merges share the project-root stash list and can shift positions).
@@ -1952,6 +1960,31 @@ export function mergeMilestoneToMain(
     logError("worktree", `merge state cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // M002/S03/T03 — Defense-in-depth try/finally envelope around the 9-step
+  // squash-merge block (#bug-list-line-22, D011/MEM044 hardening).
+  //
+  // D011 plan-time investigation outcome: the originally-claimed leak path
+  // ("auto-worktree.ts:2167-2186 throw skips restoreShelter() and stash-pop")
+  // is BENIGN in current code — restoreShelter() at the prior 9a-iii call
+  // site already runs unconditionally before the safety throw, and the
+  // stash-pop block at 9a-ii also runs before the throw. Both shelter and
+  // stash are already restored when the safety check throws. Per D011 the
+  // fix ships as a HARDENING test classified honestly in T05's bug-list
+  // annotation as `[NOT REPRODUCED M002/S03 — hardening shipped]`.
+  //
+  // The envelope is purely additive — every existing happy-path cleanup
+  // (popStashByRef call sites + restoreShelter call site at 9a-iii) is
+  // PRESERVED. Local guards (`stashPopped`, `shelterRestored`) skip the
+  // finally branch when the happy path already ran cleanup. The envelope
+  // adds defense-in-depth against any FUTURE throw inserted between the
+  // last cleanup and the end of teardown.
+  //
+  // `nothingToCommit` is hoisted above the envelope because it is consumed
+  // by post-envelope steps (9c, 10, 9b PR-create gate) — moving the `let`
+  // declaration outside `try` keeps the original assignment-once semantics
+  // while making the value visible to the rest of the function.
+  let nothingToCommit = false;
+  try {
   // 8. Squash merge — auto-resolve .gsd/ state file conflicts (#530)
   const mergeResult = nativeMergeSquash(originalBasePath_, milestoneBranch);
 
@@ -1979,6 +2012,7 @@ export function mergeMilestoneToMain(
         } catch (err) { /* stash pop conflict is non-fatal */
           logWarning("worktree", `git stash pop failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+        stashPopped = true; // M002/S03/T03 — envelope already-run guard
       }
       restoreShelter();
       // Restore cwd so the caller is not stranded on the integration branch
@@ -2051,6 +2085,7 @@ export function mergeMilestoneToMain(
           } catch (err) { /* stash pop conflict is non-fatal */
             logWarning("worktree", `git stash pop failed: ${err instanceof Error ? err.message : String(err)}`);
           }
+          stashPopped = true; // M002/S03/T03 — envelope already-run guard
         }
         restoreShelter();
         // Restore cwd so the caller is not stranded on the integration branch.
@@ -2072,7 +2107,7 @@ export function mergeMilestoneToMain(
 
   // 9. Commit (handle nothing-to-commit gracefully)
   const commitResult = nativeCommit(originalBasePath_, commitMessage);
-  const nothingToCommit = commitResult === null;
+  nothingToCommit = commitResult === null; // M002/S03/T03 — declared outside envelope
 
   // 9a. Clean up merge state files left by git merge --squash (#1853, #2912).
   // git only removes SQUASH_MSG when the commit reads it directly (plain
@@ -2095,6 +2130,13 @@ export function mergeMilestoneToMain(
   // or the commit content.  Conflict on pop is non-fatal — the stash entry is
   // preserved and the user can resolve manually with `git stash pop`.
   if (stashed) {
+    // M002/S03/T03 — mark stash as "dealt with" before the pop attempt so the
+    // envelope finally does not double-pop on a synchronous throw inside this
+    // block. Conflict-resolution paths inside the catch may leave the stash
+    // entry intact for manual recovery (logged), but that is the documented
+    // behavior of the 9a-ii path — re-popping it from the finally would be
+    // worse than the documented "preserved for manual resolution" outcome.
+    stashPopped = true;
     let stashRefForDrop: string | null = null;
     try {
       stashRefForDrop = popStashByRef(originalBasePath_, stashMarker);
@@ -2209,6 +2251,42 @@ export function mergeMilestoneToMain(
           `Aborting worktree teardown to prevent data loss. ` +
           `Remediation: (1) inspect milestoneBranch with \`git diff ${mainBranch}...${milestoneBranch} -- .gsd/\`; ` +
           `(2) commit-or-discard the .gsd/ changes manually; (3) re-run.`,
+      );
+    }
+  }
+  } finally {
+    // M002/S03/T03 — D011/MEM044 defense-in-depth cleanup envelope.
+    //
+    // This finally is ADDITIVE insurance, not the primary cleanup site:
+    //   - `stashPopped` is set by every existing happy-path / throw-arm
+    //     stash-management site inside the envelope (see flag declaration
+    //     above). When set, this branch skips the pop and the stash is
+    //     left to whichever site already managed it.
+    //   - `restoreShelter()` is internally idempotent (the helper sets
+    //     `shelterRestored = true` at the top), so a redundant call here
+    //     is a documented no-op rather than a misleading "shelter restore
+    //     failed: ENOENT" log.
+    //
+    // The envelope exists because: any FUTURE throw inserted between the
+    // last existing cleanup (9a-iii at the end of step 9a-ii) and the end
+    // of step 9b-ii would otherwise skip pop+restore. With the envelope,
+    // that hypothetical regression remains observable but recoverable.
+    if (stashed && !stashPopped) {
+      try {
+        popStashByRef(originalBasePath_, stashMarker);
+      } catch (err) {
+        logWarning(
+          "worktree",
+          `finally cleanup: stash pop failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    try {
+      restoreShelter();
+    } catch (err) {
+      logWarning(
+        "worktree",
+        `finally cleanup: restoreShelter failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
