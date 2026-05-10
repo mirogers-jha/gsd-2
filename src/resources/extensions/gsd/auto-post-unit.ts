@@ -755,9 +755,22 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
             // Without the flag, subsequent hooks (triage,
             // DB writes) would keep running against a conflicted main
             // checkout after the loop was already told to stop.
+            //
+            // ORDERING NOTE (S03/T01 — bug-list line 29 fix):
+            // Set the flag BEFORE awaiting stopAuto. If stopAuto throws,
+            // runSafely (the wrapping guard for slice-cadence-merge) will
+            // swallow the exception, control returns to post-unit, and the
+            // early-return guard at the bottom of this block must still
+            // observe sliceMergeStopped === true. Otherwise triage and
+            // subsequent hooks run against an already-conflicted main.
+            //
+            // D003 cousin audit: the only other `await stopAuto` calls in
+            // this file are at line 442 (early signal-stop guard, no flag
+            // pattern) and the sister branch below — fixed in the same
+            // commit.
             const { stopAuto } = await import("./auto.js");
-            await stopAuto(ctx, undefined, `slice-merge-conflict on ${sid}`);
             sliceMergeStopped = true;
+            await stopAuto(ctx, undefined, `slice-merge-conflict on ${sid}`);
             return;
           }
           logError("engine", `slice-cadence merge failed for ${sid}`, {
@@ -766,9 +779,12 @@ export async function postUnitPreVerification(pctx: PostUnitContext, opts?: PreV
           // Non-conflict failures (dirty main, rev-walk error, etc.) can
           // leave the checkout in an unexpected state. Stop auto-mode so
           // the next slice doesn't dispatch on top of it.
+          //
+          // ORDERING NOTE (S03/T01): see conflict branch above — flag
+          // BEFORE await so a thrown stopAuto still triggers early return.
           const { stopAuto } = await import("./auto.js");
-          await stopAuto(ctx, undefined, `slice-merge-error on ${sid}`);
           sliceMergeStopped = true;
+          await stopAuto(ctx, undefined, `slice-merge-error on ${sid}`);
         }
       });
       // Exit early after stopAuto so the rest of post-unit processing
