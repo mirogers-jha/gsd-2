@@ -431,7 +431,7 @@ export function nativeDiffNameStatus(
  * Native: libgit2 patch line stats.
  * Fallback: `git diff --numstat`.
  */
-export function nativeDiffNumstat(basePath: string, fromRef: string, toRef: string): GitNumstat[] {
+function defaultNativeDiffNumstat(basePath: string, fromRef: string, toRef: string): GitNumstat[] {
   const native = loadNative();
   if (native) {
     return native.gitDiffNumstat(basePath, fromRef, toRef);
@@ -448,6 +448,25 @@ export function nativeDiffNumstat(basePath: string, fromRef: string, toRef: stri
       path: pathParts.join("\t"),
     };
   });
+}
+
+/**
+ * D005 seam-injection (M002/S03/T02): module-level mutable runner mirrors the
+ * `_setSqliteRunnerForTests` pattern in `parallel-sqlite-cli.ts`. Tests that
+ * need to simulate libgit2/CLI mismatches (e.g. `nativeCommit→null` while
+ * numstat shows real diffs) install a fake via `_setNativeDiffNumstatForTests`.
+ * Production callers see the same signature and behavior.
+ */
+type NativeDiffNumstatFn = (basePath: string, fromRef: string, toRef: string) => GitNumstat[];
+let activeNativeDiffNumstat: NativeDiffNumstatFn = defaultNativeDiffNumstat;
+
+export function nativeDiffNumstat(basePath: string, fromRef: string, toRef: string): GitNumstat[] {
+  return activeNativeDiffNumstat(basePath, fromRef, toRef);
+}
+
+/** Test-only seam. Pass a fake to install; pass `null` to reset to default. */
+export function _setNativeDiffNumstatForTests(fn: NativeDiffNumstatFn | null): void {
+  activeNativeDiffNumstat = fn ?? defaultNativeDiffNumstat;
 }
 
 /**
@@ -923,7 +942,7 @@ export function nativeResetPaths(basePath: string, paths: string[]): void {
  * commit-msg / prepare-commit-msg hooks must fire on every GSD-automated
  * commit. (Issue #4980 CRIT-1)
  */
-export function nativeCommit(
+function defaultNativeCommit(
   basePath: string,
   message: string,
   options?: { allowEmpty?: boolean; input?: string },
@@ -950,6 +969,32 @@ export function nativeCommit(
     }
     throw err;
   }
+}
+
+/**
+ * D005 seam-injection (M002/S03/T02): module-level mutable runner mirrors
+ * `_setSqliteRunnerForTests`. Tests that need to simulate `nativeCommit→null`
+ * (libgit2 hiccup, unicode-only diff) install a fake via
+ * `_setNativeCommitForTests`.
+ */
+type NativeCommitFn = (
+  basePath: string,
+  message: string,
+  options?: { allowEmpty?: boolean; input?: string },
+) => string | null;
+let activeNativeCommit: NativeCommitFn = defaultNativeCommit;
+
+export function nativeCommit(
+  basePath: string,
+  message: string,
+  options?: { allowEmpty?: boolean; input?: string },
+): string | null {
+  return activeNativeCommit(basePath, message, options);
+}
+
+/** Test-only seam. Pass a fake to install; pass `null` to reset to default. */
+export function _setNativeCommitForTests(fn: NativeCommitFn | null): void {
+  activeNativeCommit = fn ?? defaultNativeCommit;
 }
 
 /**

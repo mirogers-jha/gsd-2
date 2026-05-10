@@ -2183,6 +2183,34 @@ export function mergeMilestoneToMain(
           `Aborting worktree teardown to prevent data loss.`,
       );
     }
+
+    // 9b-ii. Sibling safety check (M002/S03/T02 — bug-list line 31): when
+    // nativeCommit returns null ("nothing to commit") but the numstat shows
+    // ONLY `.gsd/`-prefixed file differences, the existing 9b branch above
+    // (non-.gsd/ filter) lets teardown proceed and the milestone's `.gsd/`
+    // work (summaries, roadmaps, metadata-only milestones) is silently
+    // destroyed.  This can happen on libgit2 hiccups, unicode-only diffs git
+    // CLI cannot see, or genuine metadata-only milestones.  Mirror 9b's
+    // chdir-then-throw pattern so the operator is not stranded on the
+    // integration branch (#2929 contract).  D004 reproduce-and-prevent
+    // (MEM040 silent-data-loss CRITICAL bar).
+    const gsdChanges = numstat.filter((entry) =>
+      entry.path.startsWith(".gsd/"),
+    );
+    if (gsdChanges.length > 0) {
+      const samplePaths = gsdChanges.slice(0, 3).map((e) => e.path);
+      const moreSuffix = gsdChanges.length > 3 ? ", …" : "";
+      const sample = samplePaths.join(", ") + moreSuffix;
+      process.chdir(previousCwd);
+      throw new GSDError(
+        GSD_GIT_ERROR,
+        `Squash merge produced nothing to commit but milestone branch "${milestoneBranch}" ` +
+          `has ${gsdChanges.length} .gsd/ file(s) not on "${mainBranch}" (${sample}). ` +
+          `Aborting worktree teardown to prevent data loss. ` +
+          `Remediation: (1) inspect milestoneBranch with \`git diff ${mainBranch}...${milestoneBranch} -- .gsd/\`; ` +
+          `(2) commit-or-discard the .gsd/ changes manually; (3) re-run.`,
+      );
+    }
   }
 
   // 9c. Detect whether any non-.gsd/ code files were actually merged (#1906).
