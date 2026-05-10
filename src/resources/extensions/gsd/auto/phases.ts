@@ -86,6 +86,74 @@ export function resetSessionTimeoutState(): void {
   consecutiveSessionTimeouts = 0;
 }
 
+// ─── M002/S04/T05 — checkpointSha cleanup helper + D005 seam ─────────────────
+//
+// Wraps the existing :2109-2127 `if (s.checkpointSha) { … s.checkpointSha = null; }`
+// cleanup block in a named helper so it can be invoked from a try/finally
+// envelope around `await runUnit(...)`. Without the envelope, any throw
+// between :1832 and :2109 (closeoutUnit, journal emits, zero-tool-call retry
+// logic) leaves `s.checkpointSha` populated and the underlying git ref
+// stranded. D011 verdict: REPRODUCES.
+//
+// Module-level `let activeCheckpointShaCleanup = defaultImpl` mirrors
+// `_setNativeDiffNumstatForTests` in `native-git-bridge.ts` and the seam
+// pattern from M001/S01 (`_setSqliteRunnerForTests`) and M001/S05
+// (`_setOpenDatabaseForTests`). Tests use `_setCheckpointShaCleanupForTests`
+// to inject a synthetic throw into the envelope, then assert
+// `s.checkpointSha === null` post-throw.
+type CheckpointShaCleanupFn = (
+  s: AutoSession,
+  unitId: string,
+  opts: {
+    status: "ok" | "error" | "cancelled" | "stopped" | string | undefined;
+    autoRollback: boolean;
+    notify: (msg: string, level: "info" | "warning" | "error") => void;
+  },
+) => void;
+
+function defaultCheckpointShaCleanup(
+  s: AutoSession,
+  unitId: string,
+  opts: {
+    status: "ok" | "error" | "cancelled" | "stopped" | string | undefined;
+    autoRollback: boolean;
+    notify: (msg: string, level: "info" | "warning" | "error") => void;
+  },
+): void {
+  if (!s.checkpointSha) return;
+  if (opts.status === "error" && opts.autoRollback) {
+    const rolled = rollbackToCheckpoint(s.basePath, unitId, s.checkpointSha);
+    if (rolled) {
+      opts.notify(`Rolled back to pre-unit checkpoint for ${unitId}`, "info");
+      debugLog("runUnitPhase", { phase: "checkpoint-rollback", unitId });
+    }
+  } else if (opts.status === "error") {
+    opts.notify(
+      `Unit ${unitId} failed. Pre-unit checkpoint available at ${s.checkpointSha.slice(0, 8)}`,
+      "warning",
+    );
+  } else {
+    // Success path (or unknown status — finally-on-throw treats it as cleanup,
+    // never as rollback, because the throw happened OUTSIDE the safety harness
+    // and a rollback in that case would erase legitimate work).
+    cleanupCheckpoint(s.basePath, unitId);
+    debugLog("runUnitPhase", { phase: "checkpoint-cleaned", unitId });
+  }
+  s.checkpointSha = null;
+}
+
+let activeCheckpointShaCleanup: CheckpointShaCleanupFn = defaultCheckpointShaCleanup;
+
+/** Test-only seam. Pass a fake to install; pass `null` to reset to default. */
+export function _setCheckpointShaCleanupForTests(fn: CheckpointShaCleanupFn | null): void {
+  activeCheckpointShaCleanup = fn ?? defaultCheckpointShaCleanup;
+}
+
+/** Test-only seam reset. Restores the production cleanup implementation. */
+export function _resetCheckpointShaCleanupForTests(): void {
+  activeCheckpointShaCleanup = defaultCheckpointShaCleanup;
+}
+
 // ─── generateMilestoneReport ──────────────────────────────────────────────────
 
 /**
@@ -1829,6 +1897,14 @@ export async function runUnitPhase(
     unitType,
     unitId,
   });
+  // ── M002/S04/T05 ── try/finally envelope around `await runUnit(...)` and
+  // the post-unit cleanup block at the bottom of this function. `threw` is
+  // toggled to false on every legitimate exit (early-return paths + final
+  // happy-path return). On any throw, the finally branch invokes the
+  // checkpoint cleanup helper so `s.checkpointSha` and the underlying git
+  // ref are never stranded across iterations.
+  let threw = true;
+  try {
   const unitResult = await runUnit(
     ctx,
     pi,
@@ -1898,6 +1974,7 @@ export async function runUnitPhase(
       }
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
       debugLog("autoLoop", { phase: "exit", reason: "provider-pause", isTransient: unitResult.errorContext?.isTransient });
+      threw = false;
       return { action: "break", reason: "provider-pause" };
     }
     // Timeout category covers two distinct scenarios:
@@ -1958,7 +2035,8 @@ export async function runUnitPhase(
         );
         await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
         await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
-        return { action: "break", reason: "session-timeout" };
+        threw = false;
+      return { action: "break", reason: "session-timeout" };
       }
 
       // Unit hard timeout (30min+): pause without auto-resume — stuck agent
@@ -1970,6 +2048,7 @@ export async function runUnitPhase(
       await deps.pauseAuto(ctx, pi);
       await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
+      threw = false;
       return { action: "break", reason: "unit-hard-timeout" };
     }
     if (
@@ -1984,6 +2063,7 @@ export async function runUnitPhase(
       await deps.pauseAuto(ctx, pi);
       await deps.autoCommitUnit?.(s.basePath, unitType, unitId, ctx);
       await emitCancelledUnitEnd(ic, unitType, unitId, unitStartSeq, unitResult.errorContext);
+      threw = false;
       return { action: "break", reason: "session-timeout" };
     }
     // All other cancelled states (structural errors, non-transient failures): hard stop
@@ -2008,6 +2088,7 @@ export async function runUnitPhase(
     ctx.ui.notify(cancelledStop.notifyMessage, "warning");
     await deps.stopAuto(ctx, pi, cancelledStop.stopReason);
     debugLog("autoLoop", { phase: "exit", reason: cancelledStop.loopReason });
+    threw = false;
     return { action: "break", reason: cancelledStop.loopReason };
   }
 
@@ -2061,6 +2142,7 @@ export async function runUnitPhase(
           );
           // Fall through to next iteration where dispatch will re-derive
           // and re-dispatch this unit.
+          threw = false;
           return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
         }
       }
@@ -2106,27 +2188,41 @@ export async function runUnitPhase(
   deps.emitJournalEvent({ ts: new Date().toISOString(), flowId: ic.flowId, seq: ic.nextSeq(), eventType: "unit-end", data: { unitType, unitId, status: unitResult.status, artifactVerified, ...(unitResult.errorContext ? { errorContext: unitResult.errorContext } : {}) }, causedBy: { flowId: ic.flowId, seq: unitStartSeq } });
 
   // ── Safety harness: checkpoint cleanup or rollback ──
-  if (s.checkpointSha) {
-    if (unitResult.status === "error" && safetyConfig.auto_rollback) {
-      const rolled = rollbackToCheckpoint(s.basePath, unitId, s.checkpointSha);
-      if (rolled) {
-        ctx.ui.notify(`Rolled back to pre-unit checkpoint for ${unitId}`, "info");
-        debugLog("runUnitPhase", { phase: "checkpoint-rollback", unitId });
-      }
-    } else if (unitResult.status === "error") {
-      ctx.ui.notify(
-        `Unit ${unitId} failed. Pre-unit checkpoint available at ${s.checkpointSha.slice(0, 8)}`,
-        "warning",
-      );
-    } else {
-      // Success — clean up checkpoint ref
-      cleanupCheckpoint(s.basePath, unitId);
-      debugLog("runUnitPhase", { phase: "checkpoint-cleaned", unitId });
-    }
-    s.checkpointSha = null;
-  }
+  // M002/S04/T05 — the helper extracts the original inline cleanup logic so
+  // the same code path runs both on the happy "next" return and on the
+  // throw-only finally branch below. Internal `if (!s.checkpointSha) return;`
+  // makes it safe to call when there is nothing to clean.
+  activeCheckpointShaCleanup(s, unitId, {
+    status: unitResult.status,
+    autoRollback: safetyConfig.auto_rollback,
+    notify: (msg, level) => ctx.ui.notify(msg, level),
+  });
 
+  threw = false;
   return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
+  } finally {
+    // M002/S04/T05 — try/finally envelope around `await runUnit(...)` and the
+    // post-unit cleanup block. `threw === true` means an exception escaped
+    // somewhere between the await and the happy-path `threw = false;`. In
+    // that case run the cleanup helper so `s.checkpointSha` and the underlying
+    // git ref are not stranded across iterations. Status is `undefined`
+    // because we do NOT know whether the throw came from a code-failing unit
+    // (which would warrant rollback) or from infrastructure (which would not),
+    // and a wrong rollback erases legitimate work — the helper treats unknown
+    // status as cleanup-only, never rollback.
+    if (threw) {
+      logWarning(
+        "safety",
+        "checkpointSha cleanup ran via finally after throw",
+        { unitType, unitId },
+      );
+      activeCheckpointShaCleanup(s, unitId, {
+        status: undefined,
+        autoRollback: safetyConfig.auto_rollback,
+        notify: (msg, level) => ctx.ui.notify(msg, level),
+      });
+    }
+  }
 }
 
 // ─── runFinalize ──────────────────────────────────────────────────────────────
