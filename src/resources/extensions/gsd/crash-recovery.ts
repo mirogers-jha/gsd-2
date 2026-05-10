@@ -32,7 +32,11 @@ import {
   getAllAutoWorkers,
   type AutoWorkerRow,
 } from "./db/auto-workers.js";
-import { getLatestForUnit, type DispatchStatus } from "./db/unit-dispatches.js";
+import {
+  getLatestForUnit,
+  markActiveForUnitFailed,
+  type DispatchStatus,
+} from "./db/unit-dispatches.js";
 import { getRuntimeKv, setRuntimeKv, deleteRuntimeKv } from "./db/runtime-kv.js";
 import { _getAdapter, isDbAvailable } from "./gsd-db.js";
 import { gsdRoot, normalizeRealPath } from "./paths.js";
@@ -286,12 +290,35 @@ export function formatCrashInfo(lock: LockData): string {
 }
 
 /**
- * Emit a synthetic unit-end event for a unit that crashed without emitting its own.
- * Unchanged from the file era — operates on the journal, not the lock.
+ * Emit a synthetic unit-end event for a unit that crashed without emitting its own,
+ * AND release any `unit_dispatches` rows still marked `claimed`/`running` for
+ * the same `unit_id`.
+ *
+ * The journal-side recovery (synthetic `unit-end`) is the historical behavior
+ * carried over from the file era. The dispatch-ledger cleanup is M002/S04
+ * follow-up: without it, the partial unique index
+ * `idx_unit_dispatches_active_per_unit` (on `unit_id` only) silently blocks
+ * every subsequent dispatch for the same `unit_id`, including dispatches
+ * with a different `unit_type` (e.g. a crashed `plan-slice/M002/S04` poisons
+ * `research-slice/M002/S04`). The loop's silent-skip path then burns through
+ * iterations until the stuck-detector trips, with no actionable diagnostic.
+ *
+ * Both side effects must succeed independently — if the journal write fails,
+ * we still try to release the ledger rows; if the ledger update fails, the
+ * journal still gets the synthetic close. Crash recovery is fail-soft by
+ * contract (NEVER throws), matching the existing shape of
+ * `emitOpenUnitEndForUnit`.
  */
 export function emitCrashRecoveredUnitEnd(basePath: string, lock: LockData): void {
   if (!lock.unitType || !lock.unitId || lock.unitType === "starting") return;
   emitOpenUnitEndForUnit(basePath, lock.unitType, lock.unitId, "crash-recovered");
+  try {
+    markActiveForUnitFailed(lock.unitId, "crash-recovered");
+  } catch {
+    // Crash recovery is fail-soft: a ledger-cleanup failure must never
+    // throw past this boundary. Diagnostic responsibility belongs to the
+    // markActiveForUnitFailed implementation (audit_events row per ID).
+  }
 }
 
 export function emitOpenUnitEndForUnit(

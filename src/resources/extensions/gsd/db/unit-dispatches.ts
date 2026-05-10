@@ -404,6 +404,69 @@ export function markLatestActiveForWorkerCanceled(workerId: string, reason: stri
 }
 
 /**
+ * Mark every active (`claimed`/`running`) dispatch row for `unitId` as
+ * `failed` with the given reason. Returns the number of rows updated.
+ *
+ * Used by crash recovery to release dispatches whose owning worker died
+ * mid-flight. Without this cleanup, the partial unique index
+ * `idx_unit_dispatches_active_per_unit` (on `unit_id` only — NOT
+ * `unit_type`+`unit_id`) silently blocks ALL future dispatches sharing
+ * the same `unit_id`, including dispatches of a different `unit_type`.
+ *
+ * Concrete example reproduced in the wild (M002/S04 stuck-loop forensics):
+ * a crashed `plan-slice/M002/S04` left an `unit_dispatches` row with
+ * status='running'; subsequent dispatches of `research-slice/M002/S04`
+ * silently failed the dispatch-claim and the loop hit the
+ * "derived 3 consecutive times without progress" guard with no usable
+ * diagnostic. The journal showed `iteration-start → dispatch-match → ø`
+ * for 4 consecutive iterations.
+ */
+export function markActiveForUnitFailed(unitId: string, reason: string): number {
+  if (!isDbAvailable()) return 0;
+  const now = new Date().toISOString();
+  const db = _getAdapter()!;
+  let changes = 0;
+  let updatedIds: number[] = [];
+  transaction(() => {
+    // Snapshot the IDs first so we can audit-log each row individually.
+    updatedIds = (db.prepare(
+      `SELECT id FROM unit_dispatches
+       WHERE unit_id = :unit_id AND status IN ('claimed','running')`,
+    ).all({ ":unit_id": unitId }) as { id: number }[]).map((r) => r.id);
+
+    if (updatedIds.length === 0) return;
+
+    const result = db.prepare(
+      `UPDATE unit_dispatches
+       SET status = 'failed', ended_at = :ended_at,
+           error_summary = :error_summary,
+           exit_reason = :exit_reason
+       WHERE unit_id = :unit_id AND status IN ('claimed','running')`,
+    ).run({
+      ":unit_id": unitId,
+      ":ended_at": now,
+      ":error_summary": reason,
+      ":exit_reason": reason,
+    });
+    changes =
+      typeof (result as { changes?: unknown }).changes === "number"
+        ? (result as { changes: number }).changes
+        : 0;
+  });
+  for (const id of updatedIds) {
+    insertAuditEvent({
+      eventId: randomUUID(),
+      traceId: id.toString(),
+      category: "orchestration",
+      type: "dispatch-failed",
+      ts: now,
+      payload: { dispatchId: id, unitId, reason, source: "crash-recovery" },
+    });
+  }
+  return changes;
+}
+
+/**
  * Fetch the most recent N dispatches for a unit. Used by recordDispatchClaim
  * callers to compute attempt_n and by detect-stuck.ts (B3) to consult
  * retry budget before tripping the stuck verdict.
