@@ -78,13 +78,50 @@ function ensureParallelDir(basePath: string): void {
   }
 }
 
-function isPidAlive(pid: number): boolean {
+// Test seam (D008/MEM074): module-level indirection so D004 reproduce-and-prevent
+// tests can substitute `isPidAlive` without spawning real foreign-uid PIDs.
+// Production callsites (currently `isSessionStale` only) route through this
+// indirection and fall back to `_defaultIsPidAlive` when the override is null.
+let _activeIsPidAlive: ((pid: number) => boolean) | null = null;
+
+/**
+ * Real `isPidAlive` implementation. Exported (`_defaultIsPidAlive`) only so the
+ * EPERM unit test can exercise the actual error-code branches by stubbing
+ * `process.kill` directly. Branch shape matches the EPERM-aware cousins at
+ * `session-lock.ts:668`, `sync-lock.ts:26-33`, and
+ * `slice-parallel-orchestrator.ts:114-122` (M003/S02 cousin audit).
+ *
+ *   EPERM   → true  (foreign-uid alive — multi-uid CI must not wipe these)
+ *   ESRCH   → false (truly dead — safe to clean up)
+ *   ENOENT  → false (no such process on platforms that surface this code)
+ *   unknown → true  (fail-safe: prefer keeping a maybe-alive session over
+ *                    nuking a real one on an unfamiliar errno)
+ */
+export function _defaultIsPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    if (code === "ENOENT") return false;
+    return true;
   }
+}
+
+function isPidAlive(pid: number): boolean {
+  return (_activeIsPidAlive ?? _defaultIsPidAlive)(pid);
+}
+
+/** Test seam: install a fake `isPidAlive` for `isSessionStale` / `cleanupStaleSessions`. */
+export function _setIsPidAliveForTests(impl: ((pid: number) => boolean) | null): void {
+  _activeIsPidAlive = impl;
+}
+
+/** Test seam: reset the override back to the real implementation. */
+export function _resetIsPidAliveForTests(): void {
+  _activeIsPidAlive = null;
 }
 
 // ─── Status I/O ────────────────────────────────────────────────────────────
