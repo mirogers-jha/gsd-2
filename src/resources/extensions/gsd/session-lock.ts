@@ -52,7 +52,7 @@ export interface SessionLockStatus {
   recovered?: boolean;
 }
 
-interface ProperLockfileApi {
+export interface ProperLockfileApi {
   lockSync(
     path: string,
     options?: {
@@ -94,6 +94,70 @@ let _snapshotLockPath: string | null = null;
 let _lockAcquiredAt: number = 0;
 
 const LOCK_FILE = "auto.lock";
+
+// ─── Test seams (D008/MEM074) ───────────────────────────────────────────────
+// Indirections that let race/TOCTOU tests substitute the proper-lockfile API
+// and the local `isPidAlive` without spawning real concurrent processes.
+// Both default to null; production callsites consult the override first and
+// fall back to the real implementation. See `_setLockfileForTests` /
+// `_setIsPidAliveForTests` for the test-side entry points.
+
+/** Override for `_require("proper-lockfile")` resolution. */
+let _activeLockfile: ProperLockfileApi | null = null;
+
+/** Sentinel that forces the `_require("proper-lockfile")` path to fail
+ *  (simulates "package not installed") so tests can drive `acquireFallbackLock`. */
+let _forceLockfileUnavailable: boolean = false;
+
+/** Override for the local `isPidAlive` helper used by `safeCleanupStaleLock`
+ *  and the orphan checks. Independent from the seam in `session-status-io.ts`. */
+let _activeIsPidAlive: ((pid: number) => boolean) | null = null;
+
+/**
+ * Test-only: substitute the proper-lockfile implementation for all callsites
+ * inside this module. Pass an object with `lockSync` to intercept; pass the
+ * sentinel to force the require() to fail (drives `acquireFallbackLock`).
+ * Pass `null` to clear the override.
+ */
+export function _setLockfileForTests(impl: ProperLockfileApi | "unavailable" | null): void {
+  if (impl === "unavailable") {
+    _activeLockfile = null;
+    _forceLockfileUnavailable = true;
+    return;
+  }
+  _activeLockfile = impl;
+  _forceLockfileUnavailable = false;
+}
+
+/** Test-only: clear the proper-lockfile override. */
+export function _resetLockfileForTests(): void {
+  _activeLockfile = null;
+  _forceLockfileUnavailable = false;
+}
+
+/**
+ * Test-only: substitute the LOCAL `isPidAlive` used by `safeCleanupStaleLock`
+ * and other orphan checks inside this module. The session-status-io seam is
+ * separate; this one fences race tests against the cleanup helper specifically.
+ */
+export function _setIsPidAliveForTests(impl: ((pid: number) => boolean) | null): void {
+  _activeIsPidAlive = impl;
+}
+
+/** Test-only: clear the local isPidAlive override. */
+export function _resetIsPidAliveForTests(): void {
+  _activeIsPidAlive = null;
+}
+
+/** Resolve the proper-lockfile API, honoring the test override. Throws when
+ *  forced unavailable so the existing try/catch routes to `acquireFallbackLock`. */
+function resolveLockfile(): ProperLockfileApi {
+  if (_forceLockfileUnavailable) {
+    throw new Error("proper-lockfile unavailable (test sentinel)");
+  }
+  if (_activeLockfile) return _activeLockfile;
+  return _require("proper-lockfile") as ProperLockfileApi;
+}
 
 /**
  * Derive the effective lock file name for the current process.
@@ -251,6 +315,92 @@ function assignLockState(basePath: string, release: () => void, lockFilePath: st
   _snapshotLockPath = lockFilePath;
 }
 
+/**
+ * TOCTOU-safe stale lock cleanup (M003/S02 Bug 2, R009).
+ *
+ * Replaces the prior inline `if (orphan) { rmSync; unlinkSync }` blocks at the
+ * pre-flight site (originally `session-lock.ts:308-316`) and the retry-after-
+ * fail site (originally `session-lock.ts:349-372`). Both blocks shared a TOCTOU
+ * window: between the PID-dead check and the actual `rmSync`, a fresh owner
+ * could win the proper-lockfile claim and write its own `auto.lock` — the
+ * inline cleanup would then stomp the fresh owner's metadata.
+ *
+ * Sequence (claim-then-validate, per S02-RESEARCH "Recommendation"):
+ *   1. Read existing `auto.lock` data.
+ *   2. **First PID check** — if data exists AND `isPidAlive(existingData.pid)`
+ *      is true, the fresh owner already won; abort cleanup with `ok: false`.
+ *   3. **Take an O_EXCL claim** on the lock target via `lockfile.lockSync` —
+ *      short-lived, fences other concurrent cleaners.
+ *   4. **Second PID check** (TOCTOU close) — re-read the lock data; if it has
+ *      changed (different PID/startedAt) OR the PID is now alive, release the
+ *      claim and abort with `ok: false`.
+ *   5. Only after both checks pass, `rmSync(lockDir)` + `unlinkSync(lp)`.
+ *   6. Release the claim and return `ok: true`.
+ *
+ * CRITICAL: the helper releases its claim BEFORE returning so the caller can
+ * immediately attempt the production `lockfile.lockSync` without contending
+ * with the cleanup-helper's own claim on the same target.
+ */
+export function safeCleanupStaleLock(
+  lockTarget: string,
+  lp: string,
+  lockfile: ProperLockfileApi,
+): { ok: true } | { ok: false; existingPid?: number } {
+  // (1) Read current lock data
+  const initial = readExistingLockData(lp);
+
+  // (2) First PID check — fresh owner already won?
+  if (initial && initial.pid && isPidAlive(initial.pid)) {
+    return { ok: false, existingPid: initial.pid };
+  }
+
+  // (3) Take an O_EXCL claim to fence other cleaners
+  let release: (() => void) | null = null;
+  try {
+    release = lockfile.lockSync(lockTarget, {
+      realpath: false,
+      stale: 1_800_000, // match production settings (line 320-325)
+      update: 10_000,
+    });
+  } catch {
+    // Could not take the claim — another process is already cleaning OR holds
+    // the production lock. Treat as "fresh owner already won" — fall through to
+    // existing actionable-error path; caller's lockSync will surface the
+    // contended-lock message.
+    const after = readExistingLockData(lp);
+    return { ok: false, existingPid: after?.pid };
+  }
+
+  try {
+    // (4) Second PID check — has anyone written fresh metadata while we were
+    // taking the claim, or is the PID now alive?
+    const recheck = readExistingLockData(lp);
+    if (recheck) {
+      const changed =
+        !initial ||
+        recheck.pid !== initial.pid ||
+        recheck.startedAt !== initial.startedAt;
+      if (changed || (recheck.pid && isPidAlive(recheck.pid))) {
+        return { ok: false, existingPid: recheck.pid };
+      }
+    }
+
+    // (5) Both checks passed — safe to wipe stale state
+    const lockDir = lockTarget + ".lock";
+    try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { if (existsSync(lp)) unlinkSync(lp); } catch { /* best-effort */ }
+
+    return { ok: true };
+  } finally {
+    // (6) Release the claim before returning so the caller's production
+    // lockSync attempt does not contend with the cleanup-helper's own claim
+    // on the same target.
+    if (release) {
+      try { release(); } catch { /* best-effort */ }
+    }
+  }
+}
+
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
@@ -292,7 +442,7 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
 
   let lockfile: ProperLockfileApi;
   try {
-    lockfile = _require("proper-lockfile") as ProperLockfileApi;
+    lockfile = resolveLockfile();
   } catch {
     // proper-lockfile not available — fall back to PID-based check
     return acquireFallbackLock(basePath, lp, lockData);
@@ -301,18 +451,16 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
   const gsdDir = gsdRoot(basePath);
   const lockTarget = effectiveLockTarget(gsdDir);
 
-  // #3218: Pre-flight stale lock cleanup — if the .lock/ directory exists but
-  // no auto.lock metadata is present (or the PID is dead), remove the lock
-  // directory before attempting acquisition. This prevents the 30-min stale
-  // window from blocking /gsd after crashes, SIGKILL, or laptop sleep.
+  // #3218 + M003/S02 Bug 2 (R009): Pre-flight stale lock cleanup. If the
+  // `.lock/` directory exists, attempt a TOCTOU-safe cleanup via
+  // `safeCleanupStaleLock`. On `{ ok: false }` (fresh owner won the race) we
+  // skip cleanup and proceed — the production `lockfile.lockSync` below will
+  // then fail with the actionable contended-lock message via the catch-arm.
   const lockDir = lockTarget + ".lock";
   if (existsSync(lockDir)) {
-    const existingData = readExistingLockData(lp);
-    const isOrphan = !existingData || (existingData.pid && !isPidAlive(existingData.pid));
-    if (isOrphan) {
-      try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-      try { if (existsSync(lp)) unlinkSync(lp); } catch { /* best-effort */ }
-    }
+    safeCleanupStaleLock(lockTarget, lp, lockfile);
+    // Result intentionally ignored — both ok:true and ok:false paths converge
+    // on attempting the production lockSync below.
   }
 
   try {
@@ -345,39 +493,55 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
     const existingData = readExistingLockData(lp);
     const existingPid = existingData?.pid;
 
-    // If no lock file or no alive process, try to clean up and re-acquire (#1245)
+    // If no lock file or no alive process, attempt TOCTOU-safe cleanup and
+    // re-acquire (#1245 + M003/S02 Bug 2 R009).
+    //
+    // The prior inline `rmSync` + `unlinkSync` + immediate `lockSync` retry
+    // had a race window: between the `isPidAlive` check above and the inline
+    // `rmSync`, a fresh owner could win the proper-lockfile claim and write
+    // its own `auto.lock` — the inline cleanup would stomp it.
+    //
+    // `safeCleanupStaleLock` does claim-then-validate (first PID check →
+    // O_EXCL claim → second PID check → only-then wipe → release claim). On
+    // `{ ok: false }` the fresh owner already won; we MUST NOT auto-retry the
+    // acquire — fall through to the existing actionable-error path below so
+    // the late acquirer sees the standard contended-lock message.
     if (!existingData || (existingPid && !isPidAlive(existingPid))) {
-      try {
-        const lockDir = join(lockTarget + ".lock");
-        if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
-        if (existsSync(lp)) unlinkSync(lp);
+      const cleanup = safeCleanupStaleLock(lockTarget, lp, lockfile);
+      if (cleanup.ok) {
+        try {
+          // Retry acquisition after cleanup
+          const release = lockfile.lockSync(lockTarget, {
+            realpath: false,
+            stale: 1_800_000, // 30 minutes — match primary lock settings
+            update: 10_000,
+            onCompromised: createLockCompromisedHandler(lp),
+          });
+          assignLockState(basePath, release, lp);
 
-        // Retry acquisition after cleanup
-        const release = lockfile.lockSync(lockTarget, {
-          realpath: false,
-          stale: 1_800_000, // 30 minutes — match primary lock settings
-          update: 10_000,
-          onCompromised: createLockCompromisedHandler(lp),
-        });
-        assignLockState(basePath, release, lp);
+          // Safety net — uses centralized handler to avoid double-registration
+          ensureExitHandler(lockTarget);
 
-        // Safety net — uses centralized handler to avoid double-registration
-        ensureExitHandler(lockTarget);
-
-        atomicWriteSync(lp, JSON.stringify(lockData, null, 2));
-        return { acquired: true };
-      } catch {
-        // Retry also failed — fall through to the error path
+          atomicWriteSync(lp, JSON.stringify(lockData, null, 2));
+          return { acquired: true };
+        } catch {
+          // Retry also failed — fall through to the error path with refreshed PID
+        }
       }
+      // cleanup.ok === false: fresh owner won the race; surface its PID in the
+      // actionable error below by re-reading the lock data.
     }
 
-    // #3218: Provide actionable workaround when lock recovery fails
+    // #3218: Provide actionable workaround when lock recovery fails.
+    // Re-read the lock file in case a fresh owner appeared during cleanup.
+    const finalData = readExistingLockData(lp);
+    const finalPid = finalData?.pid ?? existingPid;
     const lockDirPath = lockTarget + ".lock";
-    const reason = existingPid
-      ? `Another auto-mode session (PID ${existingPid}) appears to be running.\nStop it with \`kill ${existingPid}\` before starting a new session.`
+    const reason = finalPid
+      ? `Another auto-mode session (PID ${finalPid}) appears to be running.\nStop it with \`kill ${finalPid}\` before starting a new session.`
       : `Another auto-mode session lock is stuck on this project.\nRun: rm -rf "${lockDirPath}" && rm -f "${lp}"`;
 
-    return { acquired: false, reason, existingPid };
+    return { acquired: false, reason, existingPid: finalPid };
   }
 }
 
@@ -665,7 +829,9 @@ export function readExistingLockDataWithRetry(
   return null;
 }
 
-function isPidAlive(pid: number): boolean {
+/** Default EPERM-aware `isPidAlive`. Exported so tests can call the real
+ *  branch logic directly when stubbing `process.kill`. */
+export function _defaultIsPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   if (pid === process.pid) return false;
   try {
@@ -675,4 +841,8 @@ function isPidAlive(pid: number): boolean {
     if ((err as NodeJS.ErrnoException).code === "EPERM") return true;
     return false;
   }
+}
+
+function isPidAlive(pid: number): boolean {
+  return (_activeIsPidAlive ?? _defaultIsPidAlive)(pid);
 }
