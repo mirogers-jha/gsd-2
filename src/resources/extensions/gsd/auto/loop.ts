@@ -35,6 +35,7 @@ import {
   markRunning as markDispatchRunning,
   markCompleted as markDispatchCompleted,
   markFailed as markDispatchFailed,
+  markPolicyBlocked as markDispatchPolicyBlocked,
   getRecentForUnit as getRecentDispatchesForUnit,
   getRecentUnitKeysForProjectRoot,
 } from "../db/unit-dispatches.js";
@@ -68,7 +69,47 @@ import {
 import {
   settleDispatchCompleted,
   settleDispatchFailed,
+  settleDispatchPolicyBlocked,
 } from "./workflow-dispatch-ledger.js";
+
+// ─── M002/S04/T03 seam (per-bug `_setMarkDispatchFailedForTests`) ─────────────
+//
+// Production code MUST read `activeMarkDispatchFailed` and
+// `activeMarkPolicyBlocked` on every call (no `const x = active*` closure
+// capture). The plan-time grep gate
+// `rg -n 'const \w+ = activeMarkDispatchFailed' src/resources/extensions/gsd/`
+// MUST return zero hits.
+//
+// The seam wraps BOTH `markDispatchFailed` AND `markDispatchPolicyBlocked`
+// because the T03 D004 test exercises the post-fix invariant by injecting a
+// throwable `markDispatchPolicyBlocked` impl (verifies the helper is called)
+// and a no-op `markDispatchFailed` impl (verifies the policy-blocked branch
+// does NOT fall through to the `failed` settle path). Pattern mirrors T01's
+// `_setAgentEndDispatcherForTests`.
+type MarkDispatchFailedFn = typeof markDispatchFailed;
+type MarkDispatchPolicyBlockedFn = typeof markDispatchPolicyBlocked;
+
+const defaultMarkDispatchFailed: MarkDispatchFailedFn = markDispatchFailed;
+const defaultMarkDispatchPolicyBlocked: MarkDispatchPolicyBlockedFn = markDispatchPolicyBlocked;
+
+let activeMarkDispatchFailed: MarkDispatchFailedFn = defaultMarkDispatchFailed;
+let activeMarkPolicyBlocked: MarkDispatchPolicyBlockedFn = defaultMarkDispatchPolicyBlocked;
+
+export function _setMarkDispatchFailedForTests(impl: MarkDispatchFailedFn | null): void {
+  activeMarkDispatchFailed = impl ?? defaultMarkDispatchFailed;
+}
+
+export function _resetMarkDispatchFailedForTests(): void {
+  activeMarkDispatchFailed = defaultMarkDispatchFailed;
+}
+
+export function _setMarkPolicyBlockedForTests(impl: MarkDispatchPolicyBlockedFn | null): void {
+  activeMarkPolicyBlocked = impl ?? defaultMarkDispatchPolicyBlocked;
+}
+
+export function _resetMarkPolicyBlockedForTests(): void {
+  activeMarkPolicyBlocked = defaultMarkDispatchPolicyBlocked;
+}
 import { emitOpenUnitEndForUnit } from "../crash-recovery.js";
 import { writeUnitRuntimeRecord } from "../unit-runtime.js";
 import { openDispatchClaim } from "./workflow-dispatch-claim.js";
@@ -854,15 +895,47 @@ export async function autoLoop(
     } catch (loopErr) {
       // ── Blanket catch: absorb unexpected exceptions, apply graduated recovery ──
       const msg = loopErr instanceof Error ? loopErr.message : String(loopErr);
-      if (dispatchId !== null && !dispatchSettled && !(loopErr instanceof ModelPolicyDispatchBlockedError)) {
-        dispatchSettled = settleDispatchFailed(
-          dispatchId,
-          formatUnhandledDispatchErrorSummary({ error: loopErr }),
-          {
-            markFailed: markDispatchFailed,
-            logWriteFailure: logDispatchLedgerWriteFailure,
-          },
-        ) || dispatchSettled;
+      // M002/S04/T03 fix — policy-blocked errors used to be EXCLUDED from
+      // ledger-settle here so the row stayed in `running` until manual
+      // cleanup (RESEARCH §T03 D011 verdict: REPRODUCES). Post-fix: route
+      // policy-blocked errors through `settleDispatchPolicyBlocked` to write
+      // the new terminal `policy-blocked` status; route everything else
+      // through `settleDispatchFailed` as before. Both paths use the
+      // `_setMarkDispatchFailedForTests` / `_setMarkPolicyBlockedForTests`
+      // seams so the D004 test can deterministically assert which branch
+      // fired.
+      if (dispatchId !== null && !dispatchSettled) {
+        if (loopErr instanceof ModelPolicyDispatchBlockedError) {
+          const denyReasonsSummary = loopErr.reasons.length === 0
+            ? "no candidate models"
+            : loopErr.reasons
+                .map((r) => `${r.provider}/${r.modelId} (${r.reason})`)
+                .join("; ");
+          dispatchSettled = settleDispatchPolicyBlocked(
+            dispatchId,
+            denyReasonsSummary,
+            {
+              markPolicyBlocked: activeMarkPolicyBlocked,
+              logWriteFailure: logDispatchLedgerWriteFailure,
+            },
+          ) || dispatchSettled;
+          if (dispatchSettled) {
+            logWarning(
+              "dispatch",
+              `dispatch settled as policy-blocked (denyReasons=${denyReasonsSummary})`,
+              { dispatchId, unitType: loopErr.unitType, unitId: loopErr.unitId },
+            );
+          }
+        } else {
+          dispatchSettled = settleDispatchFailed(
+            dispatchId,
+            formatUnhandledDispatchErrorSummary({ error: loopErr }),
+            {
+              markFailed: activeMarkDispatchFailed,
+              logWriteFailure: logDispatchLedgerWriteFailure,
+            },
+          ) || dispatchSettled;
+        }
       }
 
       // Always emit iteration-end on error so the journal records iteration

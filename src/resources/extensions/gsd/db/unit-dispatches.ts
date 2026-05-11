@@ -29,7 +29,16 @@ export type DispatchStatus =
   | "failed"
   | "stuck"
   | "canceled"
-  | "paused";
+  | "paused"
+  // M002/S04/T03 — additive terminal status. Mirrors the `failed`/`completed`
+  // class semantically (the dispatch is over) but distinguishes
+  // "model policy denied this dispatch before prompt-send" from a
+  // genuine `failed` so consecutive-error budget bookkeeping in
+  // auto/loop.ts can preserve its 3-strike intent (see RESEARCH §T03).
+  // No schema migration: `status` is `TEXT` in db-coordination-schema.ts
+  // (the partial-unique index is scoped to `('claimed','running')`, so
+  // policy-blocked terminal rows do not collide with future claims).
+  | "policy-blocked";
 
 export interface UnitDispatchRow {
   id: number;
@@ -307,6 +316,68 @@ export function markFailed(dispatchId: number, opts: FailureOpts): void {
     type: "dispatch-failed",
     ts: nowIso,
     payload: { dispatchId, errorSummary: opts.errorSummary, retryAfterMs: opts.retryAfterMs ?? null },
+  });
+}
+
+export interface PolicyBlockedOpts {
+  /**
+   * One-line per-model deny-reasons summary. Encoded into `error_summary`
+   * as plain text (NOT JSON-stringified) so existing forensics queries
+   * `SELECT error_summary FROM unit_dispatches WHERE status='policy-blocked'`
+   * surface the human-readable reason directly. Same convention as
+   * `markFailed`'s `errorSummary` field.
+   */
+  errorSummary: string;
+}
+
+/**
+ * Transition a dispatch into `policy-blocked` (M002/S04/T03).
+ *
+ * Pre-fix, `auto/loop.ts:857-862` deliberately SKIPPED settling
+ * `ModelPolicyDispatchBlockedError` so the row stayed in `running`
+ * forever (or until cleanup). RESEARCH §T03 documented this as the
+ * race-window bug. The fix routes those errors through the new helper
+ * `settleDispatchPolicyBlocked` which calls into this writer.
+ *
+ * Mirrors `markFailed` shape exactly except: status terminal value is
+ * `'policy-blocked'`, no retry scheduling (policy denials don't burn
+ * the 3-strike budget), and the audit event type is
+ * `dispatch-policy-blocked`.
+ */
+export function markPolicyBlocked(dispatchId: number, opts: PolicyBlockedOpts): void {
+  if (!isDbAvailable()) return;
+  const nowIso = new Date().toISOString();
+  const db = _getAdapter()!;
+  let changes = 0;
+  transaction(() => {
+    const result = db.prepare(
+      `UPDATE unit_dispatches
+       SET status = 'policy-blocked', ended_at = :ended_at,
+           error_summary = :error_summary,
+           last_error_code = :last_error_code,
+           last_error_at = :last_error_at
+       WHERE id = :id
+         AND status IN ('claimed','running')`,
+    ).run({
+      ":id": dispatchId,
+      ":ended_at": nowIso,
+      ":error_summary": opts.errorSummary,
+      ":last_error_code": "ModelPolicyDispatchBlockedError",
+      ":last_error_at": nowIso,
+    });
+    changes =
+      typeof (result as { changes?: unknown }).changes === "number"
+        ? (result as { changes: number }).changes
+        : 0;
+  });
+  if (changes < 1) return;
+  insertAuditEvent({
+    eventId: randomUUID(),
+    traceId: dispatchId.toString(),
+    category: "orchestration",
+    type: "dispatch-policy-blocked",
+    ts: nowIso,
+    payload: { dispatchId, errorSummary: opts.errorSummary },
   });
 }
 
