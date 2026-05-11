@@ -225,6 +225,7 @@ export function createBaseSchemaObjects(db: DbAdapter, hooks: BaseSchemaHooks): 
       verdict TEXT NOT NULL DEFAULT '',
       duration_ms INTEGER DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT '',
+      event_hash TEXT UNIQUE DEFAULT NULL,
       FOREIGN KEY (milestone_id, slice_id, task_id) REFERENCES tasks(milestone_id, slice_id, id)
     )
   `);

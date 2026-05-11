@@ -424,6 +424,18 @@ export function applyMigrationV28MemoryLastHitAt(db: DbAdapter): void {
   ensureColumn(db, "memories", "last_hit_at", "ALTER TABLE memories ADD COLUMN last_hit_at TEXT DEFAULT NULL");
 }
 
+// M003/S01 Bug 3 (D003): record_verification replay idempotency. Adds a UNIQUE
+// hash column to verification_evidence so the replay arm of workflow-reconcile
+// can route the WorkflowEvent.hash through INSERT OR IGNORE — the second
+// replay of the same event becomes a silent no-op rather than a duplicate row.
+//
+// SQLite UNIQUE-with-NULLs allows arbitrarily many NULL values, so legacy
+// rows (and direct callers like complete-task that do NOT pass eventHash)
+// remain unaffected. No back-fill of historical rows (per S01-CONTEXT).
+export function applyMigrationV29VerificationEvidenceEventHash(db: DbAdapter): void {
+  ensureColumn(db, "verification_evidence", "event_hash", "ALTER TABLE verification_evidence ADD COLUMN event_hash TEXT UNIQUE DEFAULT NULL");
+}
+
 export interface MigrationV22Hooks {
   copyQualityGateRowsToRepairedTable(db: DbAdapter): void;
 }

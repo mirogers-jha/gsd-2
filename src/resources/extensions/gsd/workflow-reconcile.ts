@@ -67,6 +67,34 @@ export function _resetReconcileBetweenReadsHookForTests(): void {
   _activeReconcileBetweenReadsHook = null;
 }
 
+// ─── record_verification idempotency seam (D008, M003/S01 Bug 3) ─────────────
+//
+// The replay arm of `replayEvents` ingests `record_verification` WorkflowEvents
+// twice if a worktree-side log gets re-replayed (e.g. crash recovery, manual
+// `gsd reconcile` re-run). Pre-fix, each replay called `insertVerificationEvidence`
+// without an idempotency key — duplicate rows accumulated in `verification_evidence`.
+// Post-fix, we route the event's content hash (16-hex sha256 of {cmd, params})
+// through the new `eventHash` parameter so SQLite's UNIQUE constraint on
+// `event_hash` makes the second insert a silent no-op.
+//
+// The seam exists so the D004 reproduce-and-prevent test can observe the
+// indirection (e.g. capture the eventHash that was forwarded). Production
+// callers leave it null and the default insert path runs.
+type RecordVerificationIdempotencyArgs = Parameters<typeof insertVerificationEvidence>[0];
+let _activeRecordVerificationIdempotency:
+  | ((args: RecordVerificationIdempotencyArgs, eventHash: string) => void)
+  | null = null;
+
+export function _setRecordVerificationIdempotencyForTests(
+  impl: ((args: RecordVerificationIdempotencyArgs, eventHash: string) => void) | null,
+): void {
+  _activeRecordVerificationIdempotency = impl;
+}
+
+export function _resetRecordVerificationIdempotencyForTests(): void {
+  _activeRecordVerificationIdempotency = null;
+}
+
 // ─── Replay Helpers ──────────────────────────────────────────────────────────
 
 /**
@@ -158,7 +186,10 @@ function replayEvents(events: WorkflowEvent[]): void {
         const milestoneId = p["milestoneId"] as string;
         const sliceId = p["sliceId"] as string;
         const taskId = p["taskId"] as string;
-        insertVerificationEvidence({
+        // M003/S01 Bug 3: route event.hash into the writer as the
+        // idempotency key. SQLite UNIQUE on event_hash → second replay of
+        // the same event becomes a silent INSERT OR IGNORE no-op.
+        const args: RecordVerificationIdempotencyArgs = {
           taskId,
           sliceId,
           milestoneId,
@@ -166,7 +197,13 @@ function replayEvents(events: WorkflowEvent[]): void {
           exitCode: (p["exitCode"] as number) ?? 0,
           verdict: (p["verdict"] as string) ?? "",
           durationMs: (p["durationMs"] as number) ?? 0,
-        });
+          eventHash: event.hash,
+        };
+        if (_activeRecordVerificationIdempotency) {
+          _activeRecordVerificationIdempotency(args, event.hash);
+        } else {
+          insertVerificationEvidence(args);
+        }
         break;
       }
       case "complete_slice": {

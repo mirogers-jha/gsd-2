@@ -82,6 +82,7 @@ import {
   applyMigrationV26MilestoneCommitAttributions,
   applyMigrationV27ArtifactHash,
   applyMigrationV28MemoryLastHitAt,
+  applyMigrationV29VerificationEvidenceEventHash,
 } from "./db-migration-steps.js";
 import { isMemoriesFtsAvailableSchema, tryCreateMemoriesFtsSchema } from "./db-memory-fts-schema.js";
 import { createDbOpenState, type DbOpenPhase } from "./db-open-state.js";
@@ -110,7 +111,7 @@ const providerLoader = createSqliteProviderLoader({
   writeStderr: (message: string) => process.stderr.write(message),
 });
 
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 29;
 
 function initSchema(db: DbAdapter, fileBacked: boolean): void {
   if (fileBacked) db.exec("PRAGMA journal_mode=WAL");
@@ -347,6 +348,13 @@ function migrateSchema(db: DbAdapter): void {
     if (currentVersion < 28) {
       applyMigrationV28MemoryLastHitAt(db);
       recordSchemaVersion(db, 28);
+    }
+
+    if (currentVersion < 29) {
+      // M003/S01 Bug 3: UNIQUE event_hash on verification_evidence so the
+      // record_verification replay arm can dedupe via INSERT OR IGNORE.
+      applyMigrationV29VerificationEvidenceEventHash(db);
+      recordSchemaVersion(db, 29);
     }
 
     db.exec("COMMIT");
@@ -1682,11 +1690,18 @@ export function insertVerificationEvidence(e: {
   exitCode: number;
   verdict: string;
   durationMs: number;
+  // M003/S01 Bug 3: optional 16-hex sha256 of the underlying WorkflowEvent
+  // (cmd+params). Only the record_verification replay arm in
+  // workflow-reconcile passes this — direct callers (complete-task, etc.)
+  // omit it, which binds NULL. SQLite UNIQUE allows arbitrarily many NULLs,
+  // so direct callers stay unaffected; only the replay path becomes
+  // idempotent against duplicate events.
+  eventHash?: string;
 }): void {
   if (!currentDb) throw new GSDError(GSD_STALE_STATE, "gsd-db: No database open");
   currentDb.prepare(
-    `INSERT OR IGNORE INTO verification_evidence (task_id, slice_id, milestone_id, command, exit_code, verdict, duration_ms, created_at)
-     VALUES (:task_id, :slice_id, :milestone_id, :command, :exit_code, :verdict, :duration_ms, :created_at)`,
+    `INSERT OR IGNORE INTO verification_evidence (task_id, slice_id, milestone_id, command, exit_code, verdict, duration_ms, created_at, event_hash)
+     VALUES (:task_id, :slice_id, :milestone_id, :command, :exit_code, :verdict, :duration_ms, :created_at, :event_hash)`,
   ).run({
     ":task_id": e.taskId,
     ":slice_id": e.sliceId,
@@ -1696,6 +1711,7 @@ export function insertVerificationEvidence(e: {
     ":verdict": e.verdict,
     ":duration_ms": e.durationMs,
     ":created_at": new Date().toISOString(),
+    ":event_hash": e.eventHash ?? null,
   });
 }
 
