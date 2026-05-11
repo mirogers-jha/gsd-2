@@ -1,174 +1,135 @@
 /**
- * M003/S03/T01 — D004 reproduce-and-prevent test for the worktree-name
- * git-option-injection vector at `worktree-command.ts:309` (handleCreate)
- * and `worktree-command.ts` (handleSwitch).
+ * worktree-command-name-injection.test.ts
  *
- * Bug shape: a name like `--upload-pack=evil`, supplied via `/worktree create`
- * or the create-or-switch dispatcher, would flow into `git worktree add` argv
- * and be parsed by git as an option — RCE.
+ * D004 reproduce-and-prevent for M003/S03/T01 (Bug 1).
  *
- * Fix shape: `assertWorktreeName` (milestone-ids.ts) called BEFORE any path
- * or argv handling at both entry points. Throws `InvalidIdError({kind:
- * "worktree-name", source, attemptedId})`.
+ * Bug (HIGH-severity, FIXED-candidate per .bugs/bug-list.md): the
+ * `/worktree create <name>` flow validated `name` only at
+ * `worktree-manager.ts:229` via the inline regex `/^[a-zA-Z0-9_-]+$/`.
+ * That regex accepts `--upload-pack=foo` (and `-uX`, `-anything`) — the
+ * leading `-` slips through, so the malicious name is appended to
+ * `git worktree add` argv as a flag instead of a positional argument.
+ * `git` then interprets `--upload-pack=…` as a transport hook and runs
+ * arbitrary shell.
  *
- * Verification (per MEM012 D004 gate): comment-out / neutralise the
- * `assertWorktreeName` body and these tests must fail with the bug symptom
- * (the canonical injection strings no longer throw). Restore and confirm
- * green. The revert proof is captured in T01-SUMMARY.md verification table.
+ * Fix (T01):
+ *   1. New `assertWorktreeName` validator in `milestone-ids.ts`
+ *      (kind: 'worktree-name') tightens the contract — first char MUST be
+ *      alphanumeric, separators (`/`, `\`), NUL, `.`, `..`, and empty
+ *      strings are rejected.
+ *   2. `worktree-command.ts` calls `assertWorktreeName` BEFORE
+ *      `createWorktree` in `handleCreate`, AND at the top of
+ *      `handleSwitch` (defense in depth — `handleSwitch` is reachable
+ *      from raw user input via `/worktree switch <name>`).
+ *
+ * The existing inline regex at `worktree-manager.ts:229` is INTENTIONALLY
+ * left in place as defense-in-depth (R014: no refactor). Internal
+ * `createWorktree` callers that bypass the command layer still get the
+ * old narrower check.
+ *
+ * RED proof (pre-fix): comment out the `assertWorktreeName` call inside
+ * `handleCreate` (or revert the validator export) and the
+ * `--upload-pack=foo` assertion below fails (validator throws → caught,
+ * but with `assertWorktreeName` removed nothing throws and the malicious
+ * name reaches `createWorktree`'s inline regex which ACCEPTS `-uX`,
+ * `-anything-without-equals`, etc.).
+ *
+ * GREEN proof (post-fix): every malicious name throws `InvalidIdError`
+ * with `kind === 'worktree-name'` and the offending input preserved on
+ * `error.attemptedId`.
+ *
+ * Direct-import per MEM009/MEM011 — no barrel; relative `.ts` extensions.
  */
 
-import test from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+
 import {
-  InvalidIdError,
   assertWorktreeName,
+  InvalidIdError,
 } from "../milestone-ids.ts";
 
-// ─── Canonical injection vector (the bug) ───────────────────────────────────
-
-test("rejects the canonical git-option-injection name `--upload-pack=foo`", () => {
-  assert.throws(
-    () => assertWorktreeName("--upload-pack=foo", "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError &&
-      err.kind === "worktree-name" &&
-      err.source === "test" &&
-      err.attemptedId === "--upload-pack=foo",
-  );
-});
-
-test("rejects every leading-dash cousin git would parse as an option", () => {
-  const cousins = [
-    "-uX",
-    "-x",
-    "--exec=evil",
-    "--",
-    "-",
-    "--no-checkout",
-    "-b",
-  ];
-  for (const name of cousins) {
+describe("assertWorktreeName — git option-injection rejection (M003/S03/T01)", () => {
+  test("rejects --upload-pack=foo (canonical injection vector)", () => {
     assert.throws(
-      () => assertWorktreeName(name, "test"),
-      (err: unknown) =>
-        err instanceof InvalidIdError &&
-        err.kind === "worktree-name" &&
-        err.attemptedId === name,
-      `expected InvalidIdError(worktree-name) for ${JSON.stringify(name)}`,
+      () => assertWorktreeName("--upload-pack=foo", "test"),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidIdError, "expected InvalidIdError");
+        assert.equal(err.kind, "worktree-name");
+        assert.equal(err.attemptedId, "--upload-pack=foo");
+        assert.equal(err.source, "test");
+        return true;
+      },
     );
-  }
-});
+  });
 
-// ─── Path-separator and NUL injection ───────────────────────────────────────
+  test("rejects every leading-dash cousin", () => {
+    const malicious = ["-uX", "-x", "--exec=evil", "--", "-"];
+    for (const name of malicious) {
+      assert.throws(
+        () => assertWorktreeName(name, "test"),
+        (err: unknown) => err instanceof InvalidIdError && err.kind === "worktree-name",
+        `expected ${JSON.stringify(name)} to throw InvalidIdError(kind:'worktree-name')`,
+      );
+    }
+  });
 
-test("rejects forward-slash, backslash, NUL, and absolute-path names", () => {
-  const bad = [
-    "foo/bar",
-    "foo\\bar",
-    "foo\u0000bar",
-    "/etc/passwd",
-    "../escape",
-  ];
-  for (const name of bad) {
+  test("rejects path-separator and NUL injection", () => {
+    const malicious = ["foo/bar", "foo\\bar", "foo\u0000bar", "/etc/passwd"];
+    for (const name of malicious) {
+      assert.throws(
+        () => assertWorktreeName(name, "test"),
+        (err: unknown) => err instanceof InvalidIdError && err.kind === "worktree-name",
+        `expected ${JSON.stringify(name)} to throw InvalidIdError(kind:'worktree-name')`,
+      );
+    }
+  });
+
+  test("rejects empty / dot / dot-dot / non-string", () => {
+    assert.throws(() => assertWorktreeName("", "test"), InvalidIdError);
+    assert.throws(() => assertWorktreeName(".", "test"), InvalidIdError);
+    assert.throws(() => assertWorktreeName("..", "test"), InvalidIdError);
+    // typeof guard
     assert.throws(
-      () => assertWorktreeName(name, "test"),
-      (err: unknown) =>
-        err instanceof InvalidIdError && err.kind === "worktree-name",
-      `expected throw for ${JSON.stringify(name)}`,
+      () => assertWorktreeName(undefined as unknown as string, "test"),
+      InvalidIdError,
     );
-  }
-});
-
-// ─── Empty / dot / dot-dot / non-string ─────────────────────────────────────
-
-test("rejects empty string, `.`, `..`, and non-string input", () => {
-  assert.throws(
-    () => assertWorktreeName("", "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-  assert.throws(
-    () => assertWorktreeName(".", "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-  assert.throws(
-    () => assertWorktreeName("..", "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-  // typeof guard fires before any string ops
-  assert.throws(
-    () => assertWorktreeName(null as unknown as string, "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-  assert.throws(
-    () => assertWorktreeName(undefined as unknown as string, "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-  assert.throws(
-    () => assertWorktreeName(123 as unknown as string, "test"),
-    (err: unknown) =>
-      err instanceof InvalidIdError && err.kind === "worktree-name",
-  );
-});
-
-// ─── Shape regex: shell metas, leading underscore, whitespace ───────────────
-
-test("rejects shape violations (shell metacharacters, leading `_`, whitespace)", () => {
-  const bad = [
-    "foo bar",
-    "foo;rm",
-    "foo`rm`",
-    "foo|cat",
-    "foo$bar",
-    "foo&bg",
-    "foo(eval)",
-    "_leading",
-    " leading",
-  ];
-  for (const name of bad) {
     assert.throws(
-      () => assertWorktreeName(name, "test"),
-      (err: unknown) =>
-        err instanceof InvalidIdError && err.kind === "worktree-name",
-      `expected throw for ${JSON.stringify(name)}`,
+      () => assertWorktreeName(null as unknown as string, "test"),
+      InvalidIdError,
     );
-  }
-});
+  });
 
-// ─── Acceptance: real, valid worktree names ─────────────────────────────────
+  test("rejects names that fail the final shape regex (e.g. spaces, punctuation)", () => {
+    const malicious = ["foo bar", "foo.bar", "foo;rm", "foo`rm`", "foo$x", "_leading"];
+    for (const name of malicious) {
+      assert.throws(
+        () => assertWorktreeName(name, "test"),
+        (err: unknown) => err instanceof InvalidIdError && err.kind === "worktree-name",
+        `expected ${JSON.stringify(name)} to throw`,
+      );
+    }
+  });
 
-test("accepts conventional milestone-ish and feature-ish names", () => {
-  const good = [
-    "M001",
-    "M001-abc123",
-    "feature_x",
-    "wt_1",
-    "0",
-    "X",
-    "release-2026-05",
-  ];
-  for (const name of good) {
-    assert.doesNotThrow(
-      () => assertWorktreeName(name, "test"),
-      `expected acceptance for ${JSON.stringify(name)}`,
-    );
-  }
-});
+  test("accepts valid worktree names", () => {
+    const valid = ["M001", "M001-abc123", "feature-x", "feature_x", "wt_1", "a-b", "X", "0"];
+    for (const name of valid) {
+      assert.doesNotThrow(
+        () => assertWorktreeName(name, "test"),
+        `expected ${JSON.stringify(name)} to be accepted`,
+      );
+    }
+  });
 
-// ─── Forensic-source preservation ───────────────────────────────────────────
-
-test("preserves source string on InvalidIdError for forensic loggers", () => {
-  try {
-    assertWorktreeName("--upload-pack=evil", "worktree-command:handleCreate");
-    assert.fail("expected throw");
-  } catch (err) {
-    assert.ok(err instanceof InvalidIdError);
-    assert.equal(err.kind, "worktree-name");
-    assert.equal(err.source, "worktree-command:handleCreate");
-    assert.equal(err.attemptedId, "--upload-pack=evil");
-  }
+  test("error carries source for forensic logging", () => {
+    try {
+      assertWorktreeName("--upload-pack=foo", "worktree-command:handleCreate");
+      assert.fail("expected throw");
+    } catch (err) {
+      assert.ok(err instanceof InvalidIdError);
+      assert.equal(err.source, "worktree-command:handleCreate");
+      assert.equal(err.kind, "worktree-name");
+      assert.equal(err.attemptedId, "--upload-pack=foo");
+    }
+  });
 });

@@ -302,59 +302,41 @@ export function assertGsdDbPath(p: string, source: string = "unknown"): void {
 }
 
 /**
- * Validate a user-supplied worktree NAME (the basename used to build
- * `git worktree add` argv and the on-disk worktree directory). Closes the
- * git-option-injection vector at `worktree-command.ts:309` (handleCreate)
- * and `worktree-command.ts` (handleSwitch) — a leading `-` would be parsed
- * by `git worktree add` as an option (e.g. `--upload-pack=evil`) and could
- * execute arbitrary commands.
+ * Validate a worktree directory NAME (the segment after `.gsd/worktrees/`).
+ * Throws `InvalidIdError({kind:'worktree-name'})` when the name could be
+ * mistaken for a git option (`-x`, `--upload-pack=…`), contains separators
+ * (`/`, `\`), embeds a NUL byte, is empty, is `.` or `..`, or otherwise
+ * fails the `^[A-Za-z0-9][A-Za-z0-9_-]*$` shape that downstream
+ * `worktree-manager.ts:229` regex expects (with the additional restriction
+ * that the first char MUST be alphanumeric, closing the leading-`-` git
+ * option-injection vector).
  *
- * Rejects:
- *   - non-string input (typeof guard before any string ops)
- *   - empty string
- *   - NUL byte (`\0`)
- *   - backslash (path separator on Windows; treated as injection here)
- *   - leading `-` (the canonical git-option-injection vector)
- *   - leading `/` (absolute path masquerading as a name)
- *   - `.` or `..` (path traversal)
- *   - any other shape that does not match `^[A-Za-z0-9][A-Za-z0-9_-]*$`
- *     (final allowlist — covers internal `/`, internal control chars,
- *     shell metacharacters, etc.)
- *
- * Throws `InvalidIdError({kind:"worktree-name", source, attemptedId})` so
- * call-site forensic loggers in `worktree-command.ts` capture structured
- * context without re-parsing the message.
- *
- * NOTE: This is intentionally STRICTER than the inline regex in
- * `worktree-manager.ts:229` (which accepts a leading `-` and is therefore
- * the source of the bug). The inline regex is left in place as defense in
- * depth per R014 — non-command callers still get *some* check.
+ * Consumed at user-input entry points in `worktree-command.ts`
+ * (`handleCreate`, `handleSwitch`) BEFORE the name reaches `git worktree
+ * add` argv. The existing inline regex inside `createWorktree` remains as
+ * defense-in-depth for any internal callers that bypass the command layer.
  */
-const WORKTREE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-
-export function assertWorktreeName(name: string, source: string = "unknown"): void {
+export function assertWorktreeName(name: string, source: string = "worktree-command"): void {
   if (typeof name !== "string") {
     throw new InvalidIdError("worktree-name", source, stringifyForError(name));
   }
   if (name.length === 0) {
     throw new InvalidIdError("worktree-name", source, name);
   }
-  if (name.includes("\0")) {
-    throw new InvalidIdError("worktree-name", source, name);
-  }
-  if (name.includes("\\")) {
+  if (name.includes("\0") || name.includes("\\") || name.includes("/")) {
     throw new InvalidIdError("worktree-name", source, name);
   }
   if (name.startsWith("-")) {
-    throw new InvalidIdError("worktree-name", source, name);
-  }
-  if (name.startsWith("/")) {
+    // Git option-injection vector: `--upload-pack=foo`, `-uX`, etc.
     throw new InvalidIdError("worktree-name", source, name);
   }
   if (name === "." || name === "..") {
     throw new InvalidIdError("worktree-name", source, name);
   }
-  if (!WORKTREE_NAME_RE.test(name)) {
+  // Final shape check: same character class the inline regex used in
+  // worktree-manager.ts:229 accepted, EXCLUDING the leading-`-` case
+  // already rejected above. Allows letters, digits, hyphens, underscores.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
     throw new InvalidIdError("worktree-name", source, name);
   }
 }
