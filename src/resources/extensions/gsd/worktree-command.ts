@@ -137,15 +137,11 @@ async function worktreeHandler(
       ctx.ui.notify(`Usage: /${alias} ${trimmed.split(" ")[0]} <name>`, "warning");
       return;
     }
-    // create and switch both do the same thing: switch if exists, create if not.
-    // Compare case-insensitively to match macOS/Windows fs conventions; on hit,
-    // route silently to handleSwitch using the EXISTING canonical-cased name
-    // so we never try to mkdir a casefold-collision path (M003/S03 Bug 2).
+    // create and switch both do the same thing: switch if exists, create if not
     const mainBase = getWorktreeOriginalCwd() ?? basePath;
     const existing = listWorktrees(mainBase);
-    const collision = existing.find(wt => wt.name.toLowerCase() === name.toLowerCase());
-    if (collision) {
-      await handleSwitch(basePath, collision.name, ctx);
+    if (existing.some(wt => wt.name === name)) {
+      await handleSwitch(basePath, name, ctx);
     } else {
       await handleCreate(basePath, name, ctx);
     }
@@ -217,12 +213,9 @@ async function worktreeHandler(
     return;
   }
 
-  // Bare-name dispatch: case-insensitive collision routes silently to
-  // handleSwitch with the EXISTING canonical-cased name (M003/S03 Bug 2).
   const existing = listWorktrees(mainBase);
-  const collision = existing.find(wt => wt.name.toLowerCase() === nameOnly.toLowerCase());
-  if (collision) {
-    await handleSwitch(basePath, collision.name, ctx);
+  if (existing.some(wt => wt.name === nameOnly)) {
+    await handleSwitch(basePath, nameOnly, ctx);
   } else {
     await handleCreate(basePath, nameOnly, ctx);
   }
@@ -308,10 +301,10 @@ async function handleCreate(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   try {
-    // Reject git-option-injection (`--upload-pack=…`), separators, and
-    // shape-violating names BEFORE any state-mutating step so we never
-    // auto-commit on a doomed input. Inline regex inside `createWorktree`
-    // remains as defense-in-depth for non-command callers.
+    // Reject any name that could be parsed as a `git worktree add` option
+    // (e.g. `--upload-pack=evil`) before we touch git argv. M003/S03 Bug 1
+    // — closes the git-option-injection vector. Throws InvalidIdError so
+    // the catch block surfaces a forensic-friendly message.
     assertWorktreeName(name, "worktree-command:handleCreate");
 
     // Auto-commit dirty files before leaving current workspace (must happen
@@ -389,9 +382,9 @@ async function handleSwitch(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   try {
-    // Defense in depth: handleSwitch is reachable from raw user input
-    // (the `/worktree switch <name>` flow), not just from the line-142
-    // collision route where `name` is already a vetted `existing.find().name`.
+    // Defense-in-depth: handleSwitch is reachable from raw user input as
+    // well as from the dispatcher's exact-match path, and worktreePath()
+    // joins `name` into a filesystem path. Validate before any path math.
     assertWorktreeName(name, "worktree-command:handleSwitch");
 
     const mainBase = getWorktreeOriginalCwd() ?? basePath;
