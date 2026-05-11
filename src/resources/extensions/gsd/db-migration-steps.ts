@@ -433,7 +433,13 @@ export function applyMigrationV28MemoryLastHitAt(db: DbAdapter): void {
 // rows (and direct callers like complete-task that do NOT pass eventHash)
 // remain unaffected. No back-fill of historical rows (per S01-CONTEXT).
 export function applyMigrationV29VerificationEvidenceEventHash(db: DbAdapter): void {
-  ensureColumn(db, "verification_evidence", "event_hash", "ALTER TABLE verification_evidence ADD COLUMN event_hash TEXT UNIQUE DEFAULT NULL");
+  // SQLite forbids ALTER TABLE ADD COLUMN with inline UNIQUE — must add the
+  // column without the constraint, then attach a UNIQUE index. SQLite UNIQUE
+  // index semantics treat each NULL as distinct, so legacy rows and direct
+  // callers (NULL event_hash) remain unconstrained — matching the inline
+  // UNIQUE used in the base schema for fresh DBs.
+  ensureColumn(db, "verification_evidence", "event_hash", "ALTER TABLE verification_evidence ADD COLUMN event_hash TEXT DEFAULT NULL");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_evidence_event_hash ON verification_evidence(event_hash)");
 }
 
 export interface MigrationV22Hooks {
