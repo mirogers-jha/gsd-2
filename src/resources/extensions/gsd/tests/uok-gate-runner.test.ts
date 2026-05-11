@@ -1,17 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { closeDatabase, openDatabase, _getAdapter } from "../gsd-db.ts";
 import { UokGateRunner } from "../uok/gate-runner.ts";
+
+// Per-suite isolated basePath so audit writes from these tests never escape
+// into the real project's .gsd/audit/events.jsonl. Using process.cwd() here
+// would leak ~1k synthetic gate-run events per `npm test` invocation into
+// whatever .gsd lives at the repo root.
+let testBasePath: string;
 
 test.beforeEach(() => {
   closeDatabase();
   const ok = openDatabase(":memory:");
   assert.equal(ok, true);
+  testBasePath = mkdtempSync(join(tmpdir(), "gsd-uok-gate-runner-"));
 });
 
 test.afterEach(() => {
   closeDatabase();
+  if (testBasePath) {
+    rmSync(testBasePath, { recursive: true, force: true });
+  }
 });
 
 test("uok gate runner retries timeout failures using deterministic matrix", async () => {
@@ -39,7 +52,7 @@ test("uok gate runner retries timeout failures using deterministic matrix", asyn
   });
 
   const result = await runner.run("timeout-gate", {
-    basePath: process.cwd(),
+    basePath: testBasePath,
     traceId: "trace-a",
     turnId: "turn-a",
     milestoneId: "M001",
@@ -60,7 +73,7 @@ test("uok gate runner retries timeout failures using deterministic matrix", asyn
 test("uok gate runner returns manual-attention for unknown gate id", async () => {
   const runner = new UokGateRunner();
   const result = await runner.run("missing-gate", {
-    basePath: process.cwd(),
+    basePath: testBasePath,
     traceId: "trace-b",
     turnId: "turn-b",
   });
@@ -86,7 +99,7 @@ test("uok gate runner: gate.execute throws — outcome is fail, audit emitted, D
   let result;
   try {
     result = await runner.run("throwing-gate", {
-      basePath: process.cwd(),
+      basePath: testBasePath,
       traceId: "trace-throw",
       turnId: "turn-throw",
     });
@@ -109,7 +122,7 @@ test("uok gate runner: unknown gate id emits audit + DB row with manual-attentio
   const runner = new UokGateRunner();
 
   await runner.run("ghost-gate", {
-    basePath: process.cwd(),
+    basePath: testBasePath,
     traceId: "trace-ghost",
     turnId: "turn-ghost",
   });
@@ -135,7 +148,7 @@ test("uok gate runner: maxAttempts reported equals retryBudget + 1", async () =>
   });
 
   const result = await runner.run("budget-gate", {
-    basePath: process.cwd(),
+    basePath: testBasePath,
     traceId: "trace-budget",
     turnId: "turn-budget",
   });
