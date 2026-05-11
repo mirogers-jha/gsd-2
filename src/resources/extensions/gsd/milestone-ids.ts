@@ -145,7 +145,7 @@ export function findMilestoneIds(basePath: string): string[] {
 // ─── Validation ─────────────────────────────────────────────────────────────
 
 /** Discriminator for the kind of identifier that failed validation. */
-export type InvalidIdKind = "milestone" | "slice" | "task" | "worktree-path";
+export type InvalidIdKind = "milestone" | "slice" | "task" | "worktree-path" | "worktree-name";
 
 /**
  * Thrown by the `assert*` validators below when an identifier or path fails
@@ -298,5 +298,63 @@ export function assertGsdDbPath(p: string, source: string = "unknown"): void {
       throw new InvalidIdError(err.kind, err.source, p);
     }
     throw err;
+  }
+}
+
+/**
+ * Validate a user-supplied worktree NAME (the basename used to build
+ * `git worktree add` argv and the on-disk worktree directory). Closes the
+ * git-option-injection vector at `worktree-command.ts:309` (handleCreate)
+ * and `worktree-command.ts` (handleSwitch) — a leading `-` would be parsed
+ * by `git worktree add` as an option (e.g. `--upload-pack=evil`) and could
+ * execute arbitrary commands.
+ *
+ * Rejects:
+ *   - non-string input (typeof guard before any string ops)
+ *   - empty string
+ *   - NUL byte (`\0`)
+ *   - backslash (path separator on Windows; treated as injection here)
+ *   - leading `-` (the canonical git-option-injection vector)
+ *   - leading `/` (absolute path masquerading as a name)
+ *   - `.` or `..` (path traversal)
+ *   - any other shape that does not match `^[A-Za-z0-9][A-Za-z0-9_-]*$`
+ *     (final allowlist — covers internal `/`, internal control chars,
+ *     shell metacharacters, etc.)
+ *
+ * Throws `InvalidIdError({kind:"worktree-name", source, attemptedId})` so
+ * call-site forensic loggers in `worktree-command.ts` capture structured
+ * context without re-parsing the message.
+ *
+ * NOTE: This is intentionally STRICTER than the inline regex in
+ * `worktree-manager.ts:229` (which accepts a leading `-` and is therefore
+ * the source of the bug). The inline regex is left in place as defense in
+ * depth per R014 — non-command callers still get *some* check.
+ */
+const WORKTREE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+export function assertWorktreeName(name: string, source: string = "unknown"): void {
+  if (typeof name !== "string") {
+    throw new InvalidIdError("worktree-name", source, stringifyForError(name));
+  }
+  if (name.length === 0) {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (name.includes("\0")) {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (name.includes("\\")) {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (name.startsWith("-")) {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (name.startsWith("/")) {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (name === "." || name === "..") {
+    throw new InvalidIdError("worktree-name", source, name);
+  }
+  if (!WORKTREE_NAME_RE.test(name)) {
+    throw new InvalidIdError("worktree-name", source, name);
   }
 }

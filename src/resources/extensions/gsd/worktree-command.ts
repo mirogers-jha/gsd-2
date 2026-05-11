@@ -16,6 +16,7 @@ import { autoCommitCurrentBranch, getMainBranch, resolveGitHeadPath, nudgeGitBra
 import { runWorktreePostCreateHook } from "./auto-worktree.js";
 import { showConfirm } from "../shared/tui.js";
 import { gsdRoot, milestonesDir, resolveGsdPathContract } from "./paths.js";
+import { assertWorktreeName } from "./milestone-ids.js";
 import {
   createWorktree,
   listWorktrees,
@@ -300,6 +301,12 @@ async function handleCreate(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   try {
+    // Reject any name that could be parsed as a `git worktree add` option
+    // (e.g. `--upload-pack=evil`) before we touch git argv. M003/S03 Bug 1
+    // — closes the git-option-injection vector. Throws InvalidIdError so
+    // the catch block surfaces a forensic-friendly message.
+    assertWorktreeName(name, "worktree-command:handleCreate");
+
     // Auto-commit dirty files before leaving current workspace (must happen
     // before createWorktree so the new worktree forks from committed HEAD)
     const commitMsg = autoCommitCurrentBranch(basePath, "worktree-switch", name);
@@ -375,6 +382,11 @@ async function handleSwitch(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   try {
+    // Defense-in-depth: handleSwitch is reachable from raw user input as
+    // well as from the dispatcher's exact-match path, and worktreePath()
+    // joins `name` into a filesystem path. Validate before any path math.
+    assertWorktreeName(name, "worktree-command:handleSwitch");
+
     const mainBase = getWorktreeOriginalCwd() ?? basePath;
     const wtPath = worktreePath(mainBase, name);
 
