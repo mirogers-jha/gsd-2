@@ -15,11 +15,12 @@
  *   4. remove()  — git worktree remove + branch cleanup
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { GSDError, GSD_PARSE_ERROR, GSD_STALE_STATE, GSD_LOCK_HELD, GSD_GIT_ERROR, GSD_MERGE_CONFLICT } from "./errors.js";
 import { logWarning } from "./workflow-logger.js";
+import { withFileLockSync } from "./file-lock.js";
 import {
   nativeBranchDelete,
   nativeBranchExists,
@@ -484,6 +485,99 @@ export function findNestedGitDirs(rootPath: string): string[] {
   return results;
 }
 
+// ─── removeWorktree rescue-chain test seam (M003/S03 Bug 3, D008) ──────────
+//
+// The submodule-rescue chain in `removeWorktree` (the L561-606 region) shells
+// out to `git submodule status`, `git add`, `git commit`, `git branch` via
+// `execFileSync`. Two concurrent `removeWorktree` calls on the same worktree
+// name would otherwise interleave those calls and corrupt shared `.git` refs
+// (duplicated rescue branches or branch refs that point at empty commits).
+//
+// Bug 3 fixes the race by wrapping the entire rescue chain in
+// `withFileLockSync` against a per-worktree-name rendezvous file under the
+// MAIN repo's `.gsd/` directory. The seam below lets the D004 race test plant
+// a fake spawn that yields control mid-rescue so we can prove that two
+// concurrent invocations are serialized (post-fix) and would interleave
+// (pre-fix, when the `withFileLockSync` wrap is reverted).
+
+type RescueSpawnFn = typeof execFileSync;
+
+let _activeRemoveWorktreeSpawn: RescueSpawnFn | null = null;
+
+function rescueSpawn(...args: Parameters<RescueSpawnFn>): ReturnType<RescueSpawnFn> {
+  const impl = _activeRemoveWorktreeSpawn ?? execFileSync;
+  return (impl as any)(...args);
+}
+
+/**
+ * Test-only seam (D008/MEM074): install a custom `execFileSync` impl that the
+ * submodule-rescue chain inside `removeWorktree` will use for `git submodule
+ * status` / `git add` / `git commit` / `git branch`. Pass `null` to reset.
+ *
+ * The seam exists so the M003/S03 Bug 3 race test can deterministically force
+ * an interleaving — the production code path itself routes through
+ * `rescueSpawn` so the seam is honored.
+ */
+export function _setRemoveWorktreeSpawnForTests(impl: RescueSpawnFn | null): void {
+  _activeRemoveWorktreeSpawn = impl;
+}
+
+export function _resetRemoveWorktreeSpawnForTests(): void {
+  _activeRemoveWorktreeSpawn = null;
+}
+
+/**
+ * Resolve the rendezvous lock path for the rescue chain on `name`.
+ *
+ * Per S03-PLAN: must live under the MAIN repo's `.gsd/`, not under
+ * `basePath`/.gsd, because callers may be inside a worktree (where `.gsd/`
+ * is the worktree-local copy). Locking under the worktree-local `.gsd/`
+ * would let two distinct worktree cwds with the same `name` race against
+ * each other on the shared main `.git` refs.
+ *
+ * Resolution: `git rev-parse --git-common-dir` from `basePath` → that points
+ * at `<main>/.git`. The main repo root is its `dirname()`, and the lock file
+ * lives at `<main>/.gsd/worktree-rescue-<sanitizedName>.lock`.
+ *
+ * Falls back to `<basePath>/.gsd/...` only if git resolution fails — which
+ * still serializes within the same cwd.
+ */
+function rescueLockPath(basePath: string, name: string): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  let mainRepoRoot = basePath;
+  try {
+    const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: basePath,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    }).trim();
+    if (commonDir) mainRepoRoot = dirname(commonDir);
+  } catch (e) {
+    logWarning(
+      "reconcile",
+      `rescueLockPath: git rev-parse --git-common-dir failed; falling back to basePath: ${(e as Error).message}`,
+      { basePath, name },
+    );
+  }
+  const gsdDir = join(mainRepoRoot, ".gsd");
+  try {
+    mkdirSync(gsdDir, { recursive: true });
+  } catch { /* best effort */ }
+  const lockPath = join(gsdDir, `worktree-rescue-${sanitized}.lock`);
+  // withFileLockSync early-returns when the lock file does not exist
+  // (file-lock.ts:84). Pre-create so the lock actually engages.
+  if (!existsSync(lockPath)) {
+    try {
+      writeFileSync(lockPath, "", { flag: "wx" });
+    } catch (e: any) {
+      // EEXIST is fine — another caller raced us to create it.
+      if (e?.code !== "EEXIST") throw e;
+    }
+  }
+  return lockPath;
+}
+
 /**
  * Remove a worktree and optionally delete its branch.
  * If the process is currently inside the worktree, chdir out first.
@@ -554,54 +648,70 @@ export function removeWorktree(
   // Submodule safety (#2337): detect submodules with uncommitted changes
   // before force-removing the worktree. Force removal destroys all uncommitted
   // state, which is especially destructive for submodule directories.
+  //
+  // Bug 3 (M003/S03): wrap the entire status→add→commit→branch sequence in
+  // a single `withFileLockSync` against `<main>/.gsd/worktree-rescue-<name>.lock`
+  // so two concurrent `removeWorktree('foo')` invocations cannot interleave
+  // and corrupt shared `.git` refs (duplicated rescue branches / refs that
+  // point at empty commits). Lock contention surfaces as
+  // `GSDError(GSD_LOCK_HELD, …)` per the slice verification contract.
   let hasSubmoduleChanges = false;
   const gitmodulesPath = join(resolvedWtPath, ".gitmodules");
   if (existsSync(gitmodulesPath)) {
+    const lockPath = rescueLockPath(basePath, name);
     try {
-      const submoduleStatus = execFileSync(
-        "git", ["submodule", "status"], 
-        { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-      ).trim();
-      // Lines starting with '+' indicate uncommitted submodule changes
-      hasSubmoduleChanges = submoduleStatus.split("\n").some(
-        (line: string) => line.startsWith("+") || line.startsWith("-"),
-      );
-      if (hasSubmoduleChanges) {
-        // Save submodule changes to a labeled rescue branch instead of the
-        // shared stash list. Stash is per-repo (not per-worktree), so an
-        // entry created here would appear in the user's main-tree stash
-        // list and reference paths that disappear after worktree removal.
-        // A branch persists in the shared .git refs after worktree removal
-        // and is discoverable via `git branch --list 'gsd/submodule-rescue/*'`.
-        // (Issue #4980 HIGH-11)
-        const rescueBranch = `gsd/submodule-rescue/${name}-${Date.now()}`;
-        try {
-          execFileSync(
-            "git", ["add", "-A"],
-            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-          );
-          execFileSync(
-            "git", ["commit", "-m", `gsd: rescue submodule changes from worktree ${name}`, "--allow-empty"],
-            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-          );
-          execFileSync(
-            "git", ["branch", rescueBranch, "HEAD"],
-            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
-          );
-          logWarning(
-            "reconcile",
-            `Saved uncommitted submodule changes to rescue branch ${rescueBranch}`,
-            { worktree: name, path: resolvedWtPath, rescueBranch },
-          );
-        } catch (err) {
-          logWarning(
-            "reconcile",
-            `Submodule rescue branch creation failed — changes may be lost during force removal: ${err instanceof Error ? err.message : String(err)}`,
-            { worktree: name, path: resolvedWtPath },
-          );
+      withFileLockSync(lockPath, () => {
+        const submoduleStatus = rescueSpawn(
+          "git", ["submodule", "status"],
+          { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+        ).toString().trim();
+        // Lines starting with '+' indicate uncommitted submodule changes
+        hasSubmoduleChanges = submoduleStatus.split("\n").some(
+          (line: string) => line.startsWith("+") || line.startsWith("-"),
+        );
+        if (hasSubmoduleChanges) {
+          // Save submodule changes to a labeled rescue branch instead of the
+          // shared stash list. Stash is per-repo (not per-worktree), so an
+          // entry created here would appear in the user's main-tree stash
+          // list and reference paths that disappear after worktree removal.
+          // A branch persists in the shared .git refs after worktree removal
+          // and is discoverable via `git branch --list 'gsd/submodule-rescue/*'`.
+          // (Issue #4980 HIGH-11)
+          const rescueBranch = `gsd/submodule-rescue/${name}-${Date.now()}`;
+          try {
+            rescueSpawn(
+              "git", ["add", "-A"],
+              { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+            );
+            rescueSpawn(
+              "git", ["commit", "-m", `gsd: rescue submodule changes from worktree ${name}`, "--allow-empty"],
+              { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+            );
+            rescueSpawn(
+              "git", ["branch", rescueBranch, "HEAD"],
+              { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+            );
+            logWarning(
+              "reconcile",
+              `Saved uncommitted submodule changes to rescue branch ${rescueBranch}`,
+              { worktree: name, path: resolvedWtPath, rescueBranch },
+            );
+          } catch (err) {
+            logWarning(
+              "reconcile",
+              `Submodule rescue branch creation failed — changes may be lost during force removal: ${err instanceof Error ? err.message : String(err)}`,
+              { worktree: name, path: resolvedWtPath },
+            );
+          }
         }
+      });
+    } catch (e: any) {
+      if (e?.code === "ELOCKED") {
+        throw new GSDError(
+          GSD_LOCK_HELD,
+          `worktree-rescue lock held for "${name}" (lockPath=${lockPath}); another removeWorktree is in flight`,
+        );
       }
-    } catch (e) {
       logWarning("worktree", `submodule status check failed: ${(e as Error).message}`);
     }
   }
