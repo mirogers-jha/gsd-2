@@ -110,6 +110,31 @@ export function _setMarkPolicyBlockedForTests(impl: MarkDispatchPolicyBlockedFn 
 export function _resetMarkPolicyBlockedForTests(): void {
   activeMarkPolicyBlocked = defaultMarkDispatchPolicyBlocked;
 }
+
+// ─── M002/S04/T04 seam (per-bug `_setOpenDispatchClaimForTests`) ──────────────
+//
+// The custom-engine path used to bypass the dispatch ledger entirely
+// (RESEARCH §T04 D011 verdict: REPRODUCES by structural inspection — no
+// `openDispatchClaim` call between `buildCustomEngineIterationData` and
+// `runUnitPhaseViaContract`). Post-fix, BOTH the dev path AND the
+// custom-engine path call `activeOpenDispatchClaim(...)` so the same
+// seam exercises both branches in tests.
+//
+// Production code MUST read `activeOpenDispatchClaim` on every call (no
+// `const x = activeOpenDispatchClaim;` closure capture). Plan-time grep
+// gate `rg -n 'const \w+ = activeOpenDispatchClaim\s*[;,]'
+// src/resources/extensions/gsd/` MUST return zero hits.
+type OpenDispatchClaimFn = typeof openDispatchClaim;
+const defaultOpenDispatchClaim: OpenDispatchClaimFn = openDispatchClaim;
+let activeOpenDispatchClaim: OpenDispatchClaimFn = defaultOpenDispatchClaim;
+
+export function _setOpenDispatchClaimForTests(impl: OpenDispatchClaimFn | null): void {
+  activeOpenDispatchClaim = impl ?? defaultOpenDispatchClaim;
+}
+
+export function _resetOpenDispatchClaimForTests(): void {
+  activeOpenDispatchClaim = defaultOpenDispatchClaim;
+}
 import { emitOpenUnitEndForUnit } from "../crash-recovery.js";
 import { writeUnitRuntimeRecord } from "../unit-runtime.js";
 import { openDispatchClaim } from "./workflow-dispatch-claim.js";
@@ -567,6 +592,80 @@ export async function autoLoop(
 
         // ── Unit execution (shared with dev path) ──
         await enforceMinRequestInterval(s, prefs);
+
+        // M002/S04/T04 — open dispatch claim BEFORE runUnitPhaseViaContract
+        // so custom-engine dispatches participate in the same FK-protected
+        // unit_dispatches ledger as dev-path dispatches. Pre-fix this branch
+        // bypassed the ledger entirely (RESEARCH §T04 D011 verdict:
+        // REPRODUCES by structural inspection — `openDispatchClaim` was
+        // missing). Routes through `activeOpenDispatchClaim` so the
+        // `_setOpenDispatchClaimForTests` seam exercises both this branch
+        // AND the dev-path branch with a single per-bug seam.
+        //
+        // Mirrors the dev-path block at the lower call site verbatim,
+        // including `decideDispatchClaim` + the `dispatchDecision.action ===
+        // "skip"` diagnostic + journal emit + UI notification (Bug B2 fix
+        // is shared). Assigns `dispatchId` to the iteration-scoped variable
+        // so the existing blanket catch (M002/S04/T03) settles the row on
+        // any throw from `runUnitPhaseViaContract` or downstream.
+        const customEngineDispatchClaim = activeOpenDispatchClaim(s, flowId, turnId, iterData, {
+          getRecentDispatchesForUnit,
+          recordDispatchClaim,
+          markDispatchRunning,
+          logClaimRejected: logDispatchClaimRejected,
+          logClaimFailed: logDispatchClaimFailed,
+        });
+        const customEngineDispatchDecision = decideDispatchClaim(
+          customEngineDispatchClaim.kind === "opened"
+            ? { kind: "opened", dispatchId: customEngineDispatchClaim.dispatchId }
+            : customEngineDispatchClaim.kind === "skip"
+              ? { kind: "skip", reason: customEngineDispatchClaim.reason }
+              : { kind: "degraded" },
+        );
+        if (customEngineDispatchDecision.action === "skip") {
+          // Same Bug B2 diagnostic shape as dev path (silent dispatch-skip
+          // observability gap). RESEARCH §T04 confirmed both branches
+          // share the same skip-handling contract.
+          const diagnostic = buildDispatchSkipDiagnostic({
+            unitType: iterData.unitType,
+            unitId: iterData.unitId,
+            reason: customEngineDispatchDecision.reason,
+            existingDispatchId:
+              customEngineDispatchClaim.kind === "skip"
+                ? customEngineDispatchClaim.existingId
+                : undefined,
+            existingWorker:
+              customEngineDispatchClaim.kind === "skip"
+                ? customEngineDispatchClaim.existingWorker
+                : undefined,
+          });
+          deps.emitJournalEvent({
+            ts: new Date().toISOString(),
+            flowId,
+            seq: nextSeq(),
+            eventType: "dispatch-skip",
+            data: diagnostic.journalPayload,
+          });
+          ctx.ui.notify(diagnostic.message, "warning");
+          finishTurn("skipped", "execution", customEngineDispatchDecision.reason);
+          continue;
+        }
+        // action === "run". `dispatchId` may be null when openDispatchClaim
+        // returned `{ kind: "degraded" }` (DB unavailable / no worker /
+        // no active lease) — `decideDispatchClaim` collapses that into
+        // `{ action: "run", dispatchId: null }` so the loop continues with
+        // back-compat single-worker semantics. Emit a single warning so
+        // forensics can spot when custom-engine units run without a ledger
+        // row.
+        dispatchId = customEngineDispatchDecision.dispatchId;
+        if (dispatchId === null) {
+          logWarning(
+            "dispatch",
+            "custom-engine dispatch ledger row missing — claim-helper failed (degraded back-compat path)",
+            { unitType: iterData.unitType, unitId: iterData.unitId },
+          );
+        }
+
         let unitPhaseResult: Awaited<ReturnType<typeof runUnitPhaseViaContract>>;
         try {
           unitPhaseResult = await runUnitPhaseViaContract(
@@ -681,6 +780,17 @@ export async function autoLoop(
           },
         });
         if (reconcileFlow.action === "break") break;
+        // M002/S04/T04 — settle the dispatch row to `completed` on the
+        // verify-passed + reconciled-successfully success path. Without this
+        // settle, custom-engine ledger rows would remain in `running` until
+        // the blanket catch (T03) or crash recovery cleared them. Mirrors
+        // the dev path's `settleDispatchCompleted` call inside `runFinalize`.
+        // No-op when `dispatchId` is null (degraded path emitted a warning
+        // above; row was never opened).
+        dispatchSettled = settleDispatchCompleted(dispatchId, {
+          markCompleted: markDispatchCompleted,
+          logWriteFailure: logDispatchLedgerWriteFailure,
+        }) || dispatchSettled;
         continue;
       }
 
@@ -749,7 +859,10 @@ export async function autoLoop(
       // null when DB unavailable, no worker registered, or no active lease
       // — those degraded paths fall through to the existing single-worker
       // semantics with no ledger entry, preserving back-compat.
-      const dispatchClaim = openDispatchClaim(s, flowId, turnId, iterData, {
+      // M002/S04/T04 — routed through `activeOpenDispatchClaim` so the
+      // per-bug seam can deterministically interleave both this dev-path
+      // call AND the new custom-engine-branch call (RESEARCH §T04).
+      const dispatchClaim = activeOpenDispatchClaim(s, flowId, turnId, iterData, {
         getRecentDispatchesForUnit,
         recordDispatchClaim,
         markDispatchRunning,
@@ -923,7 +1036,7 @@ export async function autoLoop(
             logWarning(
               "dispatch",
               `dispatch settled as policy-blocked (denyReasons=${denyReasonsSummary})`,
-              { dispatchId, unitType: loopErr.unitType, unitId: loopErr.unitId },
+              { dispatchId: String(dispatchId), unitType: loopErr.unitType, unitId: loopErr.unitId },
             );
           }
         } else {
