@@ -173,8 +173,10 @@ function setup(base: string): { workerId: string; leaseToken: number; dispatchId
 test("M002/S04/T03 (a) — _setMarkDispatchFailedForTests / _setMarkPolicyBlockedForTests seam smoke test", () => {
   let policyBlockedFired = 0;
   let failedFired = 0;
-  let lastPolicyOpts: { errorSummary: string } | null = null;
-  let lastFailedOpts: { errorSummary: string } | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let lastPolicyOpts: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let lastFailedOpts: any = null;
 
   // Install fakes.
   _setMarkPolicyBlockedForTests((_id, opts) => {
@@ -258,7 +260,7 @@ test("M002/S04/T03 (b) — PRE-FIX REPRO: blanket-catch skip-of-settle leaves th
   if (dispatchId !== null && !dispatchSettled && !(loopErr instanceof ModelPolicyDispatchBlockedError)) {
     dispatchSettled = settleDispatchFailed(
       dispatchId,
-      `unhandled error: ${loopErr.message}`,
+      `unhandled error: ${(loopErr as Error).message}`,
       {
         markFailed: (_id, _opts) => { /* would write `failed` if reached */ },
         logWriteFailure: () => {},
@@ -319,7 +321,7 @@ test("M002/S04/T03 (c) — POST-FIX: branched-settle routes ModelPolicyDispatchB
       // Unreachable for this test — preserved to mirror production shape.
       dispatchSettled = settleDispatchFailed(
         dispatchId,
-        `unhandled error: ${loopErr.message}`,
+        `unhandled error: ${(loopErr as Error).message}`,
         {
           markFailed: (_id, _opts) => { /* unreachable */ },
           logWriteFailure: () => {},

@@ -98,7 +98,8 @@ import {
   _resetOpenDispatchClaimForTests,
 } from "../auto/loop.ts";
 import type { AutoSession } from "../auto/session.ts";
-import type { IterationData, GSDState } from "../auto/types.ts";
+import type { IterationData } from "../auto/types.ts";
+import type { GSDState } from "../types.ts";
 
 const LOOP_SRC = (() => {
   const here = new URL(import.meta.url);
@@ -160,7 +161,8 @@ function makeSession(workerId: string, leaseToken: number): AutoSession {
 
 test("M002/S04/T04 (a) — _setOpenDispatchClaimForTests / _resetOpenDispatchClaimForTests seam smoke test", () => {
   let fakeFired = 0;
-  let lastIterData: IterationData | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let lastIterData: any = null;
   const fake = (
     _s: AutoSession,
     _flowId: string,
