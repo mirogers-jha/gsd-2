@@ -173,16 +173,38 @@ export interface FetchedContent {
   sha256: string;
 }
 
+// ─── D008 per-bug seam (MEM074): fetch indirection for OOM-guard tests ──
+// Production callsites route through `(_activeFetch ?? fetch)(...)` so tests
+// can inject a stub fetch that returns crafted Response objects (oversized
+// Content-Length, runaway ReadableStream body, etc.) without hitting the
+// network. Reset between tests via `_resetFetchForTests()`.
+export let _activeFetch: typeof fetch | null = null;
+export function _setFetchForTests(impl: typeof fetch | null): void {
+  _activeFetch = impl;
+}
+export function _resetFetchForTests(): void {
+  _activeFetch = null;
+}
+
 /**
  * Fetch the resolved URL with a timeout and a max response size.
  * Injects a simple User-Agent so GitHub doesn't 403.
+ *
+ * Size enforcement is two-layer (belt-and-suspenders) to prevent a malicious
+ * server from OOM-ing the process by serving an enormous body:
+ *   1. BEFORE consuming the body, check `Content-Length`. If declared length
+ *      exceeds `MAX_RESPONSE_BYTES`, throw immediately — never touch the body.
+ *   2. Stream the body via `res.body.getReader()` in fixed chunks, accumulate
+ *      bytes, and abort with `reader.cancel()` if the running total ever
+ *      exceeds the cap. This guards against missing/lying Content-Length.
  */
 export async function fetchWorkflowSource(url: string): Promise<FetchedContent> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    const res = await fetch(url, {
+    const fetchImpl = _activeFetch ?? fetch;
+    const res = await fetchImpl(url, {
       signal: controller.signal,
       headers: { "User-Agent": "gsd-workflow-install" },
     });
@@ -191,15 +213,55 @@ export async function fetchWorkflowSource(url: string): Promise<FetchedContent> 
       throw new Error(`Fetch failed (${res.status} ${res.statusText}): ${url}`);
     }
 
-    // Cap size: read as a stream and bail if it exceeds MAX_RESPONSE_BYTES.
-    const buf = await res.arrayBuffer();
-    if (buf.byteLength > MAX_RESPONSE_BYTES) {
-      throw new Error(
-        `Response too large (${buf.byteLength} bytes, max ${MAX_RESPONSE_BYTES}): ${url}`,
-      );
+    // Layer 1: Content-Length pre-check. Reject before reading any body bytes.
+    const contentLengthHeader = res.headers.get("content-length");
+    if (contentLengthHeader !== null) {
+      const declared = Number.parseInt(contentLengthHeader, 10);
+      if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+        throw new Error(
+          `Response too large (${declared} bytes, max ${MAX_RESPONSE_BYTES}): ${url}`,
+        );
+      }
     }
 
-    const content = new TextDecoder().decode(buf);
+    // Layer 2: streamed body with a hard byte cap. Never buffers more than
+    // MAX_RESPONSE_BYTES + one final chunk before aborting.
+    if (!res.body) {
+      throw new Error(`Response has no body: ${url}`);
+    }
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > MAX_RESPONSE_BYTES) {
+          // Abort the underlying stream so we don't keep pulling bytes.
+          await reader.cancel();
+          throw new Error(
+            `Response too large (${total} bytes, max ${MAX_RESPONSE_BYTES}): ${url}`,
+          );
+        }
+        chunks.push(value);
+      }
+    } finally {
+      // releaseLock() is a no-op once cancel() has been called, but keep it
+      // explicit so partial-success paths (e.g. a throw between read() calls)
+      // don't leave the reader locked to a now-dead body.
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+
+    // Concatenate the accumulated chunks into a single buffer for decoding.
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const content = new TextDecoder().decode(merged);
 
     // Prefer the final response URL after redirects (e.g., gist /raw → /raw/<sha>/file.ext).
     const finalUrl = typeof res.url === "string" && res.url ? res.url : url;

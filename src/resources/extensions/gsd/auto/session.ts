@@ -114,6 +114,14 @@ export class AutoSession {
    * are detectable.
    */
   milestoneLeaseToken: number | null = null;
+  /**
+   * M003/S04 Bug 3 — per-resolver "originalCwd" slot consumed by the hybrid
+   * `getWorktreeOriginalCwd` resolver in `worktree-session-state.ts`. Set via
+   * `setWorktreeOriginalCwd` (which writes the module-global AND every
+   * registered resolver's slot) so concurrent `enterMilestone` calls do not
+   * cross-talk through a single shared module-global.
+   */
+  originalCwd: string | null = null;
   previousProjectRootEnv: string | null = null;
   hadProjectRootEnv = false;
   projectRootEnvCaptured = false;
@@ -291,6 +299,7 @@ export class AutoSession {
     this.scope = null;
     this.workerId = null;
     this.milestoneLeaseToken = null;
+    this.originalCwd = null;
     this.previousProjectRootEnv = null;
     this.hadProjectRootEnv = false;
     this.projectRootEnvCaptured = false;

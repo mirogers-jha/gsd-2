@@ -449,6 +449,10 @@ export async function regenerateIfMissing(
     case "STATE":
       filePath = join(basePath, ".gsd", "STATE.md");
       break;
+    default:
+      // Hard-fail at the boundary surfaces missing future cases instead of
+      // letting `existsSync(undefined)` throw obliquely downstream.
+      throw new Error(`Unsupported regenerateIfMissing fileType: ${fileType}`);
   }
 
   if (fileType === "SUMMARY") {

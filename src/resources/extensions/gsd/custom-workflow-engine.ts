@@ -196,22 +196,19 @@ export class CustomWorkflowEngine implements WorkflowEngine {
         }
       }
 
+      // INVARIANT: compute injectContext BEFORE writeGraph so a throw leaves
+      // GRAPH.yaml in pending state — transactional by ordering, no rollback needed.
+      // markStepActive only mutates `status`, not `id`/`prompt`, so the post-write
+      // round-trip lookup is unnecessary.
+      const enrichedPrompt = injectContext(this.runDir, next.id, next.prompt);
       const activeGraph = markStepActive(graph, next.id);
       writeGraph(this.runDir, activeGraph);
-
-      const activeStep = activeGraph.steps.find((s) => s.id === next.id);
-      if (!activeStep) {
-        throw new Error(`Active step not found after GRAPH.yaml update: ${next.id}`);
-      }
-
-      // Enrich prompt with context from prior step artifacts
-      const enrichedPrompt = injectContext(this.runDir, activeStep.id, activeStep.prompt);
 
       return {
         action: "dispatch" as const,
         step: {
           unitType: "custom-step",
-          unitId: `${activeGraph.metadata.name}/${activeStep.id}`,
+          unitId: `${activeGraph.metadata.name}/${next.id}`,
           prompt: enrichedPrompt,
         },
       };

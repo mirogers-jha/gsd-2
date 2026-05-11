@@ -266,7 +266,6 @@ export async function getActiveMilestoneId(basePath: string): Promise<string | n
     const roadmap = parseRoadmap(content);
     const summaryFile = resolveMilestoneFile(basePath, mid, "SUMMARY");
     if (summaryFile && await isTerminalMilestoneSummaryFile(summaryFile, loadFile)) continue;
-    if (!isMilestoneComplete(roadmap)) return mid;
     return mid;
   }
   return null;

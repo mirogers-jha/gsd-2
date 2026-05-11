@@ -59,17 +59,18 @@ export function resolveWorktreeProjectRoot(
   originalBasePath?: string | null,
 ): string {
   const explicitOriginal = originalBasePath?.trim();
-  if (explicitOriginal) return resolveProjectRootFromPath(explicitOriginal);
+  if (explicitOriginal) return resolveProjectRootFromPath(explicitOriginal) ?? explicitOriginal;
 
   const envProjectRoot = process.env.GSD_PROJECT_ROOT?.trim();
   if (envProjectRoot && isGsdWorktreePath(basePath)) {
-    return resolveProjectRootFromPath(envProjectRoot);
+    return resolveProjectRootFromPath(envProjectRoot) ?? envProjectRoot;
   }
 
-  return resolveProjectRootFromPath(basePath || envProjectRoot || process.cwd());
+  const fallback = basePath || envProjectRoot || process.cwd();
+  return resolveProjectRootFromPath(fallback) ?? fallback;
 }
 
-function resolveProjectRootFromPath(path: string): string {
+function resolveProjectRootFromPath(path: string): string | null {
   const normalizedPath = path.replaceAll("\\", "/");
   const segment = findWorktreeSegment(normalizedPath);
   if (!segment) {
@@ -88,7 +89,7 @@ function resolveProjectRootFromPath(path: string): string {
 
   if (candidateGsdPath === gsdHomeNorm || candidateGsdPath.startsWith(`${gsdHomeNorm}/`)) {
     const realRoot = resolveProjectRootFromGitFile(path);
-    return realRoot ?? path;
+    return realRoot;
   }
 
   return candidate;

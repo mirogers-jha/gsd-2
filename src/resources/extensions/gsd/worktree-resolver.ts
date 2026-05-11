@@ -26,6 +26,29 @@ import { getCollapseCadence, getMilestoneResquash, resquashMilestoneOnMain } fro
 import { loadEffectiveGSDPreferences } from "./preferences.js";
 import { resolveWorktreeProjectRoot, normalizeWorktreePathForCompare } from "./worktree-root.js";
 import { claimMilestoneLease, refreshMilestoneLease, releaseMilestoneLease } from "./db/milestone-leases.js";
+import { registerActiveResolver } from "./worktree-session-state.js";
+
+// ─── Test seam (D008/MEM074) ────────────────────────────────────────────────
+//
+// Per-bug test indirection over `releaseMilestoneLease` so the new
+// release-in-catch path in enterMilestone can simulate a release-throw
+// sub-case without disturbing the existing line-236 release-prior-lease
+// callsite (which intentionally stays on the direct import).
+type ReleaseMilestoneLeaseFn = typeof releaseMilestoneLease;
+let _activeReleaseMilestoneLease: ReleaseMilestoneLeaseFn | null = null;
+
+/** TEST-ONLY: install an alternate `releaseMilestoneLease` for the
+ *  enterMilestone catch-arm release path. */
+export function _setReleaseMilestoneLeaseForTests(
+  impl: ReleaseMilestoneLeaseFn | null,
+): void {
+  _activeReleaseMilestoneLease = impl;
+}
+
+/** TEST-ONLY: clear the test seam so the real impl is used again. */
+export function _resetReleaseMilestoneLeaseForTests(): void {
+  _activeReleaseMilestoneLease = null;
+}
 
 // ─── Path Comparison Helper ────────────────────────────────────────────────
 /**
@@ -125,7 +148,21 @@ export class WorktreeResolver {
   constructor(session: AutoSession, deps: WorktreeResolverDeps) {
     this.s = session;
     this.deps = deps;
+    // M003/S04 Bug 3 — register ourselves with the hybrid `getWorktreeOriginalCwd`
+    // resolver so writes via `setWorktreeOriginalCwd` propagate to `this.s.originalCwd`
+    // and reads prefer this resolver's slot over the legacy module-global.
+    //
+    // Stored on `this._registryHandle` so a future `dispose()` can call
+    // `unregisterActiveResolver(this._registryHandle)` symmetrically. No
+    // teardown hook today (resolver lives for process lifetime in CLI / auto-mode);
+    // long-running multi-resolver hosts should add an explicit unregister.
+    this._registryHandle = { s: this.s };
+    registerActiveResolver(this._registryHandle);
   }
+
+  /** Registry handle kept so future `dispose()` can call `unregisterActiveResolver`
+   *  symmetrically. Private — internal bookkeeping only. */
+  private readonly _registryHandle!: { s: AutoSession };
 
   // ── Getters ────────────────────────────────────────────────────────────
 
@@ -396,18 +433,54 @@ export class WorktreeResolver {
       ctx.notify(`Entered worktree for ${milestoneId} at ${wtPath}`, "info");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+
+      // M003/S04 Bug 1: release the milestone lease we acquired earlier in
+      // this same enterMilestone call. Otherwise it persists until TTL
+      // (~5 minutes) and other workers see "held by other worker" until
+      // it times out — even after this worker has fully degraded to
+      // project-root mode. Release-in-catch only; the original error is
+      // what the caller cares about, so we never re-throw release errors.
+      let leaseReleased = false;
+      if (this.s.workerId && this.s.milestoneLeaseToken !== null) {
+        try {
+          const releaseFn = _activeReleaseMilestoneLease ?? releaseMilestoneLease;
+          releaseFn(
+            this.s.workerId,
+            milestoneId,
+            this.s.milestoneLeaseToken,
+          );
+          leaseReleased = true;
+        } catch (releaseErr) {
+          debugLog("WorktreeResolver", {
+            action: "enterMilestone",
+            phase: "lease-release-on-catch",
+            error: releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+          });
+          // Do NOT re-throw — the original error is what the caller
+          // cares about; release-error is best-effort and observable
+          // via the debugLog above.
+        }
+        // Always reset state regardless of release-throw — the lease is
+        // either gone or unrecoverable; either way this worker no
+        // longer holds it for the purposes of subsequent enterMilestone
+        // calls in the same session.
+        this.s.milestoneLeaseToken = null;
+        this.s.currentMilestoneId = null;
+      }
+
       debugLog("WorktreeResolver", {
         action: "enterMilestone",
         milestoneId,
         result: "error",
         error: msg,
+        leaseReleased,
       });
       emitJournalEvent(this.s.originalBasePath || this.s.basePath, {
         ts: new Date().toISOString(),
         flowId: randomUUID(),
         seq: 0,
         eventType: "worktree-create-failed",
-        data: { milestoneId, error: msg, fallback: "project-root" },
+        data: { milestoneId, error: msg, fallback: "project-root", leaseReleased },
       });
       ctx.notify(
         `Auto-worktree creation for ${milestoneId} failed: ${msg}. Continuing in project root.`,
