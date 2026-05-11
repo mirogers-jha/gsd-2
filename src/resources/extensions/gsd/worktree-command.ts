@@ -137,11 +137,17 @@ async function worktreeHandler(
       ctx.ui.notify(`Usage: /${alias} ${trimmed.split(" ")[0]} <name>`, "warning");
       return;
     }
-    // create and switch both do the same thing: switch if exists, create if not
+    // create and switch both do the same thing: switch if exists, create if not.
+    // M003/S03/T02 Bug 2: case-insensitive collision check — on macOS/Windows
+    // the underlying fs is case-insensitive, so a user typing `FOO` when
+    // worktree `foo` already exists must route to graceful switch using the
+    // EXISTING canonical-cased name (NOT the user-typed casing). Silent — no
+    // notify, no prompt.
     const mainBase = getWorktreeOriginalCwd() ?? basePath;
     const existing = listWorktrees(mainBase);
-    if (existing.some(wt => wt.name === name)) {
-      await handleSwitch(basePath, name, ctx);
+    const collision = existing.find(wt => wt.name.toLowerCase() === name.toLowerCase());
+    if (collision) {
+      await handleSwitch(basePath, collision.name, ctx);
     } else {
       await handleCreate(basePath, name, ctx);
     }
@@ -213,9 +219,11 @@ async function worktreeHandler(
     return;
   }
 
+  // M003/S03/T02 Bug 2: case-insensitive collision (see line-142 dispatch above).
   const existing = listWorktrees(mainBase);
-  if (existing.some(wt => wt.name === nameOnly)) {
-    await handleSwitch(basePath, nameOnly, ctx);
+  const collision = existing.find(wt => wt.name.toLowerCase() === nameOnly.toLowerCase());
+  if (collision) {
+    await handleSwitch(basePath, collision.name, ctx);
   } else {
     await handleCreate(basePath, nameOnly, ctx);
   }
