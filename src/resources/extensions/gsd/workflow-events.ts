@@ -31,12 +31,51 @@ export interface WorkflowEvent {
   session_id: string;       // engine-generated UUID, stable per process lifetime
 }
 
+// ─── appendEvent test seam (D008, M003/S01 Bug 1) ────────────────────────
+
+/**
+ * Test-only seam that lets `tests/workflow-events-append-race.test.ts`
+ * deterministically interleave `appendEvent`'s file-locked write against a
+ * planted `compactMilestoneEvents` truncate. Production code paths must
+ * never set this — only `_setAppendEventFsForTests` from the race test.
+ *
+ * Both functions fall back to the real `appendFileSync` / `withFileLockSync`
+ * imports when the corresponding override is absent. Underscore-prefixed per
+ * the project D008 seam-injection convention; reset to `null` in `afterEach`.
+ */
+interface AppendEventFsOverrides {
+  appendFileSync?: typeof appendFileSync;
+  withFileLockSync?: typeof withFileLockSync;
+}
+
+let _activeAppendEventFs: AppendEventFsOverrides | null = null;
+
+export function _setAppendEventFsForTests(impl: AppendEventFsOverrides | null): void {
+  _activeAppendEventFs = impl;
+}
+
+export function _resetAppendEventFsForTests(): void {
+  _activeAppendEventFs = null;
+}
+
 // ─── appendEvent ─────────────────────────────────────────────────────────
 
 /**
  * Append one event to .gsd/event-log.jsonl.
  * Computes a content hash from cmd+params (deterministic, independent of ts/actor/session).
  * Creates .gsd directory if needed.
+ *
+ * Cross-process safety (M003/S01 Bug 1): the actual content append runs
+ * inside `withFileLockSync(logPath, ...)`, the same proper-lockfile primitive
+ * `compactMilestoneEvents` already uses. ELOCKED bubbles up raw to the
+ * caller (per S01-CONTEXT — no `GSD_EVENT_LOG_BUSY` wrapper, no retry
+ * tuning) after the default 5 × 50ms = 250ms wait.
+ *
+ * The `mkdirSync(.gsd/)` and the no-op touch run OUTSIDE the lock because
+ * `withFileLockSync` early-returns when the target file does not exist
+ * (`file-lock.ts:79`). Without the touch, the very first append in a fresh
+ * project would bypass the lock entirely. The touch is itself idempotent
+ * (empty string append) so two racing touches are harmless.
  */
 export function appendEvent(
   basePath: string,
@@ -55,7 +94,22 @@ export function appendEvent(
   };
   const dir = join(basePath, ".gsd");
   mkdirSync(dir, { recursive: true });
-  appendFileSync(join(dir, "event-log.jsonl"), JSON.stringify(fullEvent) + "\n", "utf-8");
+  const logPath = join(dir, "event-log.jsonl");
+
+  // Pre-create the log so withFileLockSync actually engages on the first
+  // event (see jsdoc above). Use the REAL appendFileSync so race tests that
+  // inject via `_setAppendEventFsForTests` only intercept the actual event
+  // write inside the lock body, not this idempotent touch.
+  if (!existsSync(logPath)) {
+    appendFileSync(logPath, "", "utf-8");
+  }
+
+  const appendFn = _activeAppendEventFs?.appendFileSync ?? appendFileSync;
+  const lockFn = _activeAppendEventFs?.withFileLockSync ?? withFileLockSync;
+
+  lockFn(logPath, () => {
+    appendFn(logPath, JSON.stringify(fullEvent) + "\n", "utf-8");
+  });
 }
 
 // ─── readEvents ──────────────────────────────────────────────────────────
