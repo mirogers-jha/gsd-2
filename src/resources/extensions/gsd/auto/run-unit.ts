@@ -244,10 +244,22 @@ export async function runUnit(
   // ── Create the agent_end promise (per-unit one-shot) ──
   // This happens after newSession completes so session-switch agent_end events
   // from the previous session cannot resolve the new unit.
-  _setSessionSwitchInFlight(false);
+  //
+  // M002/S04/T02 fix — install the resolver BEFORE clearing the
+  // session-switch flag. Pre-fix order was:
+  //   _setSessionSwitchInFlight(false);   // ← clear flag first
+  //   new Promise(resolve => _setCurrentResolve(resolve));
+  // which opens a brief race window between the two synchronous statements.
+  // If a fresh agent_end arrives in that window, `resolveAgentEnd` (auto/resolve.ts)
+  // sees `_sessionSwitchInFlight === false` AND `_currentResolve === null`, hits
+  // the else branch, and DROPS the event with a `no-pending-resolve` debug log.
+  // Post-fix: install resolver first so `_currentResolve` is non-null before any
+  // listener can observe the cleared flag. See S04 RESEARCH §T02 (D011 verdict:
+  // REPRODUCES) for the full analysis.
   const unitPromise = new Promise<UnitResult>((resolve) => {
     _setCurrentResolve(resolve);
   });
+  _setSessionSwitchInFlight(false);
   const pendingSwitchCancellation = _consumePendingSwitchCancellation();
   if (pendingSwitchCancellation) {
     _clearCurrentResolve();
