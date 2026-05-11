@@ -93,14 +93,22 @@ assertTrue(
   `no return statements use bare s.currentUnit.startedAt (found ${bareReturnCount}, expected 0) (#2939)`,
 );
 
-// ── Test 4: the return at end of runUnitPhase uses optional chaining ────
-// The final `return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt } }`
-// must use optional chaining.
+// ── Test 4: the return at end of runUnitPhase consumes the snapshot ──
+// M002/S04/T06 superseded the original #2939 optional-chaining workaround
+// with a stronger fix: snapshot `startedAt` BEFORE the runUnit await and
+// consume it in every downstream read. The final return now reads
+// `unitStartedAt: startedAtSnapshot`, which cannot deref-null because it
+// is a primitive number captured before the race window.
+//
+// The original optional-chaining shape (`s.currentUnit?.startedAt`)
+// degraded to `undefined` on the race; the snapshot shape preserves the
+// real timestamp. Both prevent the TypeError but the snapshot is
+// semantically richer.
 
-const finalReturnPattern = /unitStartedAt:\s*s\.currentUnit\?\.startedAt/;
+const finalReturnSnapshotPattern = /unitStartedAt:\s*startedAtSnapshot/;
 assertTrue(
-  finalReturnPattern.test(afterCloseout),
-  "final return uses s.currentUnit?.startedAt with optional chaining (#2939)",
+  finalReturnSnapshotPattern.test(afterCloseout),
+  "final return uses `unitStartedAt: startedAtSnapshot` — M002/S04/T06 snapshot (supersedes #2939 optional-chain workaround)",
 );
 
 report();

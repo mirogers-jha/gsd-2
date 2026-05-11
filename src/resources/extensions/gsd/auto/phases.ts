@@ -154,6 +154,43 @@ export function _resetCheckpointShaCleanupForTests(): void {
   activeCheckpointShaCleanup = defaultCheckpointShaCleanup;
 }
 
+// ─── M002/S04/T06 seam (per-bug `_setStopAutoForTests`) ───────────────────────
+//
+// Per RESEARCH §T06 + §R6, the bug is the bare `s.currentUnit.startedAt`
+// reads downstream of `await runUnit(...)` in `runUnitPhase`. Between the
+// await returning and the `if (s.currentUnit) { closeoutUnit(...) }`
+// branch, an in-flight `stopAuto` (driven by the UI handler, supervision,
+// or another awaited path) may have fired `s.reset()` which nulls
+// `s.currentUnit`. The post-fix snapshots `startedAt` once before the
+// await and consumes the snapshot in every downstream read.
+//
+// The seam wraps the bound `stopAuto` reference so a D004 test can install
+// an impl that synchronously nulls `s.currentUnit` and then resolves —
+// simulating the in-flight race deterministically. Production code reads
+// `activeStopAuto` on every call (no `const x = activeStopAuto` closure
+// capture). Plan-time grep gate `rg -n 'const \w+ = activeStopAuto\s*[;,]'
+// src/resources/extensions/gsd/` MUST return zero hits.
+//
+// The seam is intentionally referenced only at the closeout-adjacent
+// stopAuto call sites within `runUnitPhase` so production behavior is
+// otherwise unchanged. The MEM060 source-guard subtest pins both the
+// snapshot AND the seam wiring.
+type StopAutoFn = LoopDeps["stopAuto"];
+const defaultStopAutoPassthrough: (deps: LoopDeps) => StopAutoFn = (deps) => deps.stopAuto;
+let activeStopAutoSelector: (deps: LoopDeps) => StopAutoFn = defaultStopAutoPassthrough;
+
+export function _setStopAutoForTests(impl: StopAutoFn | null): void {
+  if (impl === null) {
+    activeStopAutoSelector = defaultStopAutoPassthrough;
+  } else {
+    activeStopAutoSelector = () => impl;
+  }
+}
+
+export function _resetStopAutoForTests(): void {
+  activeStopAutoSelector = defaultStopAutoPassthrough;
+}
+
 // ─── generateMilestoneReport ──────────────────────────────────────────────────
 
 /**
@@ -1913,6 +1950,28 @@ export async function runUnitPhase(
     unitId,
     finalPrompt,
   );
+
+  // M002/S04/T06 — snapshot `startedAt` immediately after `await runUnit`
+  // returns so downstream reads survive an in-flight `stopAuto` between
+  // here and the closeout block (RESEARCH §T06 D011 verdict: REPRODUCES;
+  // the L2017 comment cites #2939). All downstream reads inside this
+  // function MUST consume `startedAtSnapshot`, NEVER bare
+  // `s.currentUnit.startedAt`. The MEM060 source-guard subtest pins this.
+  //
+  // Fallback to `Date.now()` when `s.currentUnit` is already null on
+  // return — defensive but unlikely (runUnit's session-creation phase
+  // ran before this point so `s.currentUnit` was populated by the
+  // dispatcher). The fallback never breaks downstream consumers because
+  // `startedAt` is treated as a numeric duration anchor.
+  const startedAtSnapshot = s.currentUnit?.startedAt ?? Date.now();
+  if (s.currentUnit === null) {
+    logWarning(
+      "safety",
+      "M002/S04/T06: closeoutUnit ran with snapshotted startedAt — currentUnit was nulled mid-flight",
+      { unitType, unitId },
+    );
+  }
+
   s.lastUnitAgentEndMessages = unitResult.event?.messages ?? null;
   debugLog("autoLoop", {
     phase: "runUnit-end",
@@ -2067,13 +2126,19 @@ export async function runUnitPhase(
       return { action: "break", reason: "session-timeout" };
     }
     // All other cancelled states (structural errors, non-transient failures): hard stop
+    // M002/S04/T06 — closeoutUnit consumes startedAtSnapshot (NOT
+    // s.currentUnit.startedAt) so the call survives an in-flight stopAuto
+    // that nulled s.currentUnit between the await runUnit return above
+    // and this point. The if-guard remains for the broader closeout
+    // boundary (auditMetric/snapshotOpts may also assume currentUnit
+    // shape), but the timestamp itself comes from the snapshot.
     if (s.currentUnit) {
       await deps.closeoutUnit(
         ctx,
         s.basePath,
         unitType,
         unitId,
-        s.currentUnit.startedAt,
+        startedAtSnapshot,
         deps.buildSnapshotOpts(unitType, unitId),
       );
     }
@@ -2086,7 +2151,7 @@ export async function runUnitPhase(
       unitResult.errorContext,
     );
     ctx.ui.notify(cancelledStop.notifyMessage, "warning");
-    await deps.stopAuto(ctx, pi, cancelledStop.stopReason);
+    await activeStopAutoSelector(deps)(ctx, pi, cancelledStop.stopReason);
     debugLog("autoLoop", { phase: "exit", reason: cancelledStop.loopReason });
     threw = false;
     return { action: "break", reason: cancelledStop.loopReason };
@@ -2097,6 +2162,8 @@ export async function runUnitPhase(
   // crash between iterations.
   // Guard: stopAuto() may have nulled s.currentUnit via s.reset() while
   // this coroutine was suspended at `await runUnit(...)` (#2939).
+  // M002/S04/T06: closeoutUnit consumes startedAtSnapshot (snapshotted
+  // before the runUnit await) so the timestamp survives the race.
   if (s.currentUnit) {
     // Reset session timeout counter — any successful unit clears the slate
     consecutiveSessionTimeouts = 0;
@@ -2105,7 +2172,7 @@ export async function runUnitPhase(
       s.basePath,
       unitType,
       unitId,
-      s.currentUnit.startedAt,
+      startedAtSnapshot,
       deps.buildSnapshotOpts(unitType, unitId),
     );
   }
@@ -2119,8 +2186,10 @@ export async function runUnitPhase(
   {
     const currentLedger = deps.getLedger() as { units: Array<{ type: string; id: string; startedAt: number; toolCalls: number }> } | null;
     if (currentLedger?.units) {
+      // M002/S04/T06 — match against startedAtSnapshot so the lookup
+      // succeeds even after an in-flight stopAuto nulled s.currentUnit.
       const lastUnit = [...currentLedger.units].reverse().find(
-        (u: { type: string; id: string; startedAt: number; toolCalls: number }) => u.type === unitType && u.id === unitId && u.startedAt === s.currentUnit?.startedAt,
+        (u: { type: string; id: string; startedAt: number; toolCalls: number }) => u.type === unitType && u.id === unitId && u.startedAt === startedAtSnapshot,
       );
       if (lastUnit && lastUnit.toolCalls === 0) {
         if (USER_DRIVEN_DEEP_UNITS.has(unitType) && isAwaitingUserInput(s.lastUnitAgentEndMessages ?? undefined)) {
@@ -2142,8 +2211,10 @@ export async function runUnitPhase(
           );
           // Fall through to next iteration where dispatch will re-derive
           // and re-dispatch this unit.
+          // M002/S04/T06 — return startedAtSnapshot so callers see the
+          // real timestamp even if s.currentUnit was nulled mid-flight.
           threw = false;
-          return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
+          return { action: "next", data: { unitStartedAt: startedAtSnapshot, requestDispatchedAt: unitResult.requestDispatchedAt } };
         }
       }
     }
@@ -2198,8 +2269,11 @@ export async function runUnitPhase(
     notify: (msg, level) => ctx.ui.notify(msg, level),
   });
 
+  // M002/S04/T06 — final return uses startedAtSnapshot so the timestamp
+  // survives an in-flight stopAuto that nulled s.currentUnit between the
+  // await runUnit return and this return.
   threw = false;
-  return { action: "next", data: { unitStartedAt: s.currentUnit?.startedAt, requestDispatchedAt: unitResult.requestDispatchedAt } };
+  return { action: "next", data: { unitStartedAt: startedAtSnapshot, requestDispatchedAt: unitResult.requestDispatchedAt } };
   } finally {
     // M002/S04/T05 — try/finally envelope around `await runUnit(...)` and the
     // post-unit cleanup block. `threw === true` means an exception escaped
