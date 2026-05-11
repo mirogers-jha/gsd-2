@@ -137,11 +137,15 @@ async function worktreeHandler(
       ctx.ui.notify(`Usage: /${alias} ${trimmed.split(" ")[0]} <name>`, "warning");
       return;
     }
-    // create and switch both do the same thing: switch if exists, create if not
+    // create and switch both do the same thing: switch if exists, create if not.
+    // Compare case-insensitively to match macOS/Windows fs conventions; on hit,
+    // route silently to handleSwitch using the EXISTING canonical-cased name
+    // so we never try to mkdir a casefold-collision path (M003/S03 Bug 2).
     const mainBase = getWorktreeOriginalCwd() ?? basePath;
     const existing = listWorktrees(mainBase);
-    if (existing.some(wt => wt.name === name)) {
-      await handleSwitch(basePath, name, ctx);
+    const collision = existing.find(wt => wt.name.toLowerCase() === name.toLowerCase());
+    if (collision) {
+      await handleSwitch(basePath, collision.name, ctx);
     } else {
       await handleCreate(basePath, name, ctx);
     }
@@ -213,9 +217,12 @@ async function worktreeHandler(
     return;
   }
 
+  // Bare-name dispatch: case-insensitive collision routes silently to
+  // handleSwitch with the EXISTING canonical-cased name (M003/S03 Bug 2).
   const existing = listWorktrees(mainBase);
-  if (existing.some(wt => wt.name === nameOnly)) {
-    await handleSwitch(basePath, nameOnly, ctx);
+  const collision = existing.find(wt => wt.name.toLowerCase() === nameOnly.toLowerCase());
+  if (collision) {
+    await handleSwitch(basePath, collision.name, ctx);
   } else {
     await handleCreate(basePath, nameOnly, ctx);
   }
