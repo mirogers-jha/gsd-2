@@ -371,10 +371,31 @@ export async function selectAndApplyModel(
             // Without this, a light-start unit on retry 3 would revert to the light
             // model after escalating to heavy on retries 1 and 2.
             const tierOrder: Record<string, number> = { light: 0, standard: 1, heavy: 2 };
-            const prevOrder = tierOrder[retryContext.previousTier] ?? 0;
-            const freshOrder = tierOrder[classification.tier] ?? 0;
-            if (prevOrder > freshOrder) {
-              classification = { ...classification, tier: retryContext.previousTier as ComplexityTier, reason: "retained escalated tier from retry" };
+            // M002/S05/T02 — explicit unknown-tier guard (was silent `?? 0`
+            // fall-through). Pre-fix any unknown previousTier (typo,
+            // experimental tier, version skew between routing config and
+            // dispatch caller) silently coerced to 0 = "light" via the
+            // `?? 0` default, which combined with a fresh classification of
+            // "light" produced no escalation/retention — the retry silently
+            // ran against the lowest-tier model with no observability.
+            // Post-fix: detect unknown explicitly, log a warn (uses
+            // "dispatch" component since "model-selection" is not in the
+            // LogComponent union — see workflow-logger.ts:37-66), and
+            // escalate to "standard" so the retry runs against the mid-tier
+            // model (graceful degradation, not silent downgrade).
+            if (!(retryContext.previousTier in tierOrder)) {
+              logWarning(
+                "dispatch",
+                `unknown previousTier '${retryContext.previousTier}'; escalating to standard for retry safety (M002/S05/T02)`,
+                { previousTier: String(retryContext.previousTier), unitType, unitId },
+              );
+              classification = { ...classification, tier: "standard" as ComplexityTier, reason: "unknown previousTier escalated to standard" };
+            } else {
+              const prevOrder = tierOrder[retryContext.previousTier] ?? 0;
+              const freshOrder = tierOrder[classification.tier] ?? 0;
+              if (prevOrder > freshOrder) {
+                classification = { ...classification, tier: retryContext.previousTier as ComplexityTier, reason: "retained escalated tier from retry" };
+              }
             }
           }
         }

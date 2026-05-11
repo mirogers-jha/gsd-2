@@ -175,12 +175,12 @@ test("M002/S05/T01 (b) — POST-FIX: setWidgetMode against two project dirs writ
   assert.equal(readWidgetModeLine(prefsA), "min", "post-fix: A's pref file has the value");
   assert.equal(readWidgetModeLine(prefsB), null, "post-fix: B's pref file is UNTOUCHED");
 
-  // ── Step 2: toggle to "compact" in project B ──
+  // ── Step 2: toggle to "small" in project B ──
   // Pre-fix BUG: this would have re-used the cached A path and stomped A.
   // Post-fix: each call resolves fresh, so B writes to B.
-  setWidgetMode("compact", prefsB, prefsB);
-  assert.equal(getWidgetMode(prefsB, prefsB), "compact", "in-memory mode reflects B's toggle");
-  assert.equal(readWidgetModeLine(prefsB), "compact", "post-fix: B's pref file has the value");
+  setWidgetMode("small", prefsB, prefsB);
+  assert.equal(getWidgetMode(prefsB, prefsB), "small", "in-memory mode reflects B's toggle");
+  assert.equal(readWidgetModeLine(prefsB), "small", "post-fix: B's pref file has the value");
   assert.equal(
     readWidgetModeLine(prefsA),
     "min",
@@ -192,7 +192,7 @@ test("M002/S05/T01 (b) — POST-FIX: setWidgetMode against two project dirs writ
   assert.equal(readWidgetModeLine(prefsA), "full", "post-fix: A's pref file has the new value");
   assert.equal(
     readWidgetModeLine(prefsB),
-    "compact",
+    "small",
     "post-fix CRITICAL: B's pref file is UNCHANGED after A's re-toggle (cross-project isolation enforced both directions)",
   );
 });
