@@ -542,9 +542,24 @@ export function _resetRemoveWorktreeSpawnForTests(): void {
  * Falls back to `<basePath>/.gsd/...` only if git resolution fails — which
  * still serializes within the same cwd.
  */
-function rescueLockPath(basePath: string, name: string): string {
-  const sanitized = name.replace(/[^a-zA-Z0-9._-]/g, "_");
-  let mainRepoRoot = basePath;
+/**
+ * Resolve `<main>/.git` for `basePath` via `git rev-parse --git-common-dir`.
+ *
+ * For a worktree cwd, `basePath/.git` is a pointer FILE pointing at
+ * `<main>/.git/worktrees/<name>` — it is NOT a directory containing
+ * `worktrees/`. So callers that need the SHARED git dir (where the
+ * `worktrees/` subdir actually lives) must ask git for `--git-common-dir`
+ * rather than computing `join(basePath, ".git")`.
+ *
+ * Returns `null` on resolution failure; callers must handle null
+ * (typically by skipping cleanup and warning).
+ *
+ * Bug 4 (M003/S03 #2821 stale-orphan): the inline
+ * `join(basePath, ".git", "worktrees", name)` at the cleanup site below
+ * silently no-ops when `basePath` is a worktree path, leaving the real
+ * internal dir at `<main>/.git/worktrees/<name>` orphaned.
+ */
+function gitCommonDir(basePath: string): string | null {
   try {
     const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
       cwd: basePath,
@@ -552,14 +567,37 @@ function rescueLockPath(basePath: string, name: string): string {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5_000,
     }).trim();
-    if (commonDir) mainRepoRoot = dirname(commonDir);
+    return commonDir || null;
   } catch (e) {
     logWarning(
       "reconcile",
-      `rescueLockPath: git rev-parse --git-common-dir failed; falling back to basePath: ${(e as Error).message}`,
-      { basePath, name },
+      `git-common-dir-failed: ${(e as Error).message}`,
+      { event: "git-common-dir-failed", basePath, error: (e as Error).message },
     );
+    return null;
   }
+}
+
+/**
+ * Resolve the git-internal worktree metadata directory
+ * (`<main>/.git/worktrees/<name>`) for `basePath`.
+ *
+ * Returns `null` when `git rev-parse --git-common-dir` fails — callers
+ * must skip cleanup in that case (preserves the prior silent-skip
+ * semantics on degenerate states; visibility is added via the warning
+ * emitted by `gitCommonDir`).
+ */
+function worktreeInternalDir(basePath: string, name: string): string | null {
+  const commonDir = gitCommonDir(basePath);
+  if (!commonDir) return null;
+  return join(commonDir, "worktrees", name);
+}
+
+function rescueLockPath(basePath: string, name: string): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  let mainRepoRoot = basePath;
+  const commonDir = gitCommonDir(basePath);
+  if (commonDir) mainRepoRoot = dirname(commonDir);
   const gsdDir = join(mainRepoRoot, ".gsd");
   try {
     mkdirSync(gsdDir, { recursive: true });
@@ -760,8 +798,15 @@ export function removeWorktree(
     // causes every subsequent `/gsd auto` to re-enter the stale worktree.
     if (existsSync(resolvedWtPath)) {
       try {
-        const wtInternalDir = join(basePath, ".git", "worktrees", name);
-        if (existsSync(wtInternalDir)) {
+        // Bug 4 (M003/S03 #2821): resolve `.git` via
+        // `git rev-parse --git-common-dir` so this works whether `basePath`
+        // is the main repo (where `.git` is a directory) OR a worktree
+        // (where `.git` is a pointer file). The prior inline
+        // `join(basePath, ".git", "worktrees", name)` silently no-op'd on
+        // the pointer-file case, orphaning the real internal dir at
+        // `<main>/.git/worktrees/<name>`.
+        const wtInternalDir = worktreeInternalDir(basePath, name);
+        if (wtInternalDir && existsSync(wtInternalDir)) {
           rmSync(wtInternalDir, { recursive: true, force: true });
         }
         rmSync(resolvedWtPath, { recursive: true, force: true });
