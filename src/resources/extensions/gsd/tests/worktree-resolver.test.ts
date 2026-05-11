@@ -338,17 +338,33 @@ test("enterMilestone does NOT update basePath on creation failure", () => {
   );
 });
 
-test("enterMilestone uses originalBasePath as base for worktree ops", () => {
+test("enterMilestone uses originalBasePath as base for worktree ops", (t) => {
+  // Use a tmpdir-anchored basePath so emitJournalEvent does not leak into
+  // the live project's .gsd/. See assertSafeStateWrite + LiveStateWriteViolation
+  // for the leak-class fix.
+  //
+  // GSD_PROJECT_ROOT must be unset for the duration so resolveWorktreeProjectRoot()
+  // doesn't short-circuit our tmp paths back to the live repo (MEM032).
+  const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "gsd-resolver-orig-")));
+  const prevProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
+  t.after(() => {
+    if (prevProjectRoot !== undefined) process.env.GSD_PROJECT_ROOT = prevProjectRoot;
+    rmSync(projectRoot, { recursive: true, force: true });
+  });
+  const wtParent = join(projectRoot, ".gsd", "worktrees", "M001");
+  mkdirSync(wtParent, { recursive: true });
+
   const s = makeSession({
-    basePath: "/project/.gsd/worktrees/M001",
-    originalBasePath: "/project",
+    basePath: wtParent,
+    originalBasePath: projectRoot,
   });
   let createdFrom = "";
   const deps = makeDeps({
     getAutoWorktreePath: () => null,
     createAutoWorktree: (basePath: string, _mid: string) => {
       createdFrom = basePath;
-      return "/project/.gsd/worktrees/M002";
+      return join(projectRoot, ".gsd", "worktrees", "M002");
     },
   });
   const ctx = makeNotifyCtx();
@@ -356,19 +372,33 @@ test("enterMilestone uses originalBasePath as base for worktree ops", () => {
 
   resolver.enterMilestone("M002", ctx);
 
-  assert.equal(createdFrom, "/project"); // uses originalBasePath, not current basePath
+  assert.equal(createdFrom, projectRoot); // uses originalBasePath, not current basePath
 });
 
-test("enterMilestone does not create double-nested worktree when originalBasePath is empty and basePath is a worktree path", () => {
+test("enterMilestone does not create double-nested worktree when originalBasePath is empty and basePath is a worktree path", (t) => {
   // Regression test for #3729: when s.originalBasePath is "" (falsy) and
   // s.basePath is already a worktree path, the expression
   // `this.s.originalBasePath || this.s.basePath` evaluates to the worktree
   // path. Passing that to createAutoWorktree produces a doubly-nested path
   // like /project/.gsd/worktrees/M001/.gsd/worktrees/M002.
-  const wtPath = "/project/.gsd/worktrees/M001";
+  //
+  // Use a tmpdir basePath instead of a fixture string so emitJournalEvent
+  // does not leak into the live .gsd/ — see LiveStateWriteViolation. Also
+  // unset GSD_PROJECT_ROOT (MEM032) so worktree resolution does not escape
+  // the tmp sandbox.
+  const projectRoot = realpathSync(mkdtempSync(join(tmpdir(), "gsd-resolver-nested-")));
+  const prevProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
+  t.after(() => {
+    if (prevProjectRoot !== undefined) process.env.GSD_PROJECT_ROOT = prevProjectRoot;
+    rmSync(projectRoot, { recursive: true, force: true });
+  });
+  const wtPath = join(projectRoot, ".gsd", "worktrees", "M001");
+  mkdirSync(wtPath, { recursive: true });
+
   const s = makeSession({
     basePath: wtPath,
-    originalBasePath: "/project", // will be overwritten below to simulate the bug
+    originalBasePath: projectRoot, // will be overwritten below to simulate the bug
   });
   // Simulate the real bug: originalBasePath is "" (falsy) as it is when AutoSession
   // is constructed fresh or reset() is called without auto-start re-setting it.
@@ -379,7 +409,7 @@ test("enterMilestone does not create double-nested worktree when originalBasePat
     getAutoWorktreePath: () => null,
     createAutoWorktree: (basePath: string, _mid: string) => {
       createdFromPath = basePath;
-      return `/project/.gsd/worktrees/M002`;
+      return join(projectRoot, ".gsd", "worktrees", "M002");
     },
   });
   const ctx = makeNotifyCtx();
@@ -389,7 +419,7 @@ test("enterMilestone does not create double-nested worktree when originalBasePat
 
   // The path passed to createAutoWorktree must be the project root, NOT the
   // worktree path. If it equals wtPath the worktree would be created at
-  // /project/.gsd/worktrees/M001/.gsd/worktrees/M002 (double-nesting).
+  // <projectRoot>/.gsd/worktrees/M001/.gsd/worktrees/M002 (double-nesting).
   assert.ok(
     !createdFromPath.includes("/.gsd/worktrees/"),
     `createAutoWorktree must be called with project root, got: "${createdFromPath}"`,

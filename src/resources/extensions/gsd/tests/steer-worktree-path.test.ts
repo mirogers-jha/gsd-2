@@ -13,8 +13,16 @@ import { getAutoWorktreePath } from "../auto-worktree.ts";
 describe("steer worktree path resolution (#3476)", () => {
   let projectRoot: string;
   let worktreePath: string;
+  let prevProjectRoot: string | undefined;
 
   beforeEach(() => {
+    // GSD_PROJECT_ROOT must be unset so resolveWorktreeProjectRoot does not
+    // short-circuit our tmp worktree paths back to the live project (MEM032).
+    // Without this, appendOverride writes to the live OVERRIDES.md and the
+    // assertSafeStateWrite guard fires (LiveStateWriteViolation).
+    prevProjectRoot = process.env.GSD_PROJECT_ROOT;
+    delete process.env.GSD_PROJECT_ROOT;
+
     projectRoot = mkdtempSync(join(tmpdir(), "gsd-steer-wt-"));
     mkdirSync(join(projectRoot, ".gsd"), { recursive: true });
 
@@ -25,6 +33,9 @@ describe("steer worktree path resolution (#3476)", () => {
 
   afterEach(() => {
     rmSync(projectRoot, { recursive: true, force: true });
+    if (prevProjectRoot !== undefined) {
+      process.env.GSD_PROJECT_ROOT = prevProjectRoot;
+    }
   });
 
   test("appendOverride writes to canonical project .gsd/ when worktree path is used", async () => {

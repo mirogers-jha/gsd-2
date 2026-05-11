@@ -33,6 +33,7 @@ import { getGateIdsForTurn, type OwnerTurn } from "./gate-registry.js";
 import { logError, logWarning } from "./workflow-logger.js";
 import { createDbAdapter, type DbAdapter } from "./db-adapter.js";
 import { assertGsdDbPath, InvalidIdError } from "./milestone-ids.js";
+import { assertSafeStateWrite } from "./paths.js";
 import { createBaseSchemaObjects } from "./db-base-schema.js";
 import { createCoordinationTablesV24 } from "./db-coordination-schema.js";
 import { createDbConnectionCache, type DbConnectionCacheEntry } from "./db-connection-cache.js";
@@ -2742,6 +2743,13 @@ export function insertAuditEvent(entry: {
   payload: Record<string, unknown>;
 }): void {
   if (!currentDb) return;
+  // Refuse to write audit events to the live project's shared SQLite db
+  // from a test context. Without this guard, a test calling production code
+  // with a fixture basePath can insert into the live audit_events table via
+  // the cached connection — and the running PI process projects those rows
+  // back to the live journal jsonl on disk.
+  // See assertSafeStateWrite for full rationale and bypass mechanism.
+  if (currentPath) assertSafeStateWrite(currentPath, "insertAuditEvent");
   transaction(() => {
     currentDb!.prepare(
       `INSERT OR IGNORE INTO audit_events (

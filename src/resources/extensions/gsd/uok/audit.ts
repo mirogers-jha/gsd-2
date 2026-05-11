@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 
 import { isStaleWrite } from "../auto/turn-epoch.js";
 import { withFileLockSync } from "../file-lock.js";
-import { gsdRoot } from "../paths.js";
+import { gsdRoot, assertSafeStateWrite } from "../paths.js";
 import { isDbAvailable, insertAuditEvent } from "../gsd-db.js";
 import { CURRENT_UOK_CONTRACT_VERSION, validateAuditEvent, type AuditEventEnvelope } from "./contracts.js";
 
@@ -42,6 +42,14 @@ export function buildAuditEnvelope(args: {
 export function emitUokAuditEvent(basePath: string, event: AuditEventEnvelope): void {
   // Drop writes from a turn superseded by timeout recovery / cancellation.
   if (isStaleWrite("uok-audit")) return;
+  // Refuse to write to live project state from a test context — this is the
+  // class of leak that lets a fixture basePath like "/project" insert
+  // audit_events into the live shared SQLite db (cached connection) and then
+  // get projected back to the live journal jsonl by the running PI process.
+  // See MEM-Tests / commits 394292f66, 1a628fc93 for prior leak fixes.
+  // Hoisted ABOVE all try/catch so the diagnostic surfaces loudly even when
+  // upstream callers (emitJournalEvent) wrap in silent best-effort blocks.
+  assertSafeStateWrite(gsdRoot(basePath), "emitUokAuditEvent");
   const validation = validateAuditEvent(event);
   if (!validation.ok) {
     throw new Error(`Invalid UOK audit event: ${validation.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`);

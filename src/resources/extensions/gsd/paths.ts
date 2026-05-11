@@ -448,6 +448,129 @@ function assertNotGlobalGsdHome(basePath: string, result: string): void {
   }
 }
 
+// ─── Live-State Write Guard ───────────────────────────────────────────────────
+//
+// When tests pass a fixture basePath (e.g. "/project") to production code that
+// writes to .gsd/ state files, the path resolution can escape to the live
+// project's .gsd/ — especially when GSD_PROJECT_ROOT is set or the cached DB
+// connection is shared. This guard refuses such writes when running under a
+// test harness, surfacing the misuse loudly instead of silently corrupting
+// the live project's state.
+//
+// See MEM-Tests / commits 394292f66, 1a628fc93 for prior leak fixes.
+// Set GSD_INTERNAL_ALLOW_LIVE_WRITE=1 to bypass (e.g. for the project's own
+// integration tests that intentionally exercise the live workspace).
+
+function normPath(p: string): string {
+  let r: string;
+  try { r = realpathSync.native(p); } catch { r = p; }
+  const s = r.replaceAll("\\", "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? s.toLowerCase() : s;
+}
+
+function isUnderLiveProject(target: string): boolean {
+  const liveRoot = process.env.GSD_PROJECT_ROOT?.trim();
+  if (!liveRoot) return false;
+  let liveNorm: string;
+  try {
+    liveNorm = normPath(liveRoot);
+  } catch {
+    return false;
+  }
+  if (!liveNorm) return false;
+  let targetNorm: string;
+  try {
+    targetNorm = normPath(target);
+  } catch {
+    targetNorm = target.replaceAll("\\", "/").replace(/\/+$/, "");
+  }
+  return targetNorm === liveNorm
+    || targetNorm.startsWith(`${liveNorm}/`)
+    || targetNorm.startsWith(`${liveNorm}/.gsd`);
+}
+
+function isUnderGsdHomeProjects(target: string): boolean {
+  let homeNorm: string;
+  try {
+    homeNorm = normPath(gsdHome());
+  } catch {
+    return false;
+  }
+  if (!homeNorm) return false;
+  let targetNorm: string;
+  try {
+    targetNorm = normPath(target);
+  } catch {
+    targetNorm = target.replaceAll("\\", "/").replace(/\/+$/, "");
+  }
+  return targetNorm.startsWith(`${homeNorm}/projects/`);
+}
+
+function isLikelyTestContext(): boolean {
+  // node:test runner sets NODE_TEST_CONTEXT for child workers.
+  if (process.env.NODE_TEST_CONTEXT) return true;
+  // Vitest sets VITEST=true.
+  if (process.env.VITEST) return true;
+  // Common test runners.
+  if (process.env.JEST_WORKER_ID) return true;
+  if (process.env.NODE_ENV === "test") return true;
+  // node --test sets process.execArgv to include --test for the parent
+  // orchestrator; the spawned worker has it too (Node 22+).
+  if (process.execArgv.some(a => a === "--test" || a.startsWith("--test="))) return true;
+  return false;
+}
+
+/**
+ * Tagged error class for live-project state-write violations.
+ *
+ * Caller code that wraps state writes in silent try/catch blocks (e.g. the
+ * journal/audit best-effort writers) MUST re-throw `LiveStateWriteViolation`
+ * specifically — silently swallowing this error defeats the diagnostic.
+ */
+export class LiveStateWriteViolation extends Error {
+  readonly operation: string;
+  readonly targetPath: string;
+  constructor(operation: string, targetPath: string, message: string) {
+    super(message);
+    this.name = "LiveStateWriteViolation";
+    this.operation = operation;
+    this.targetPath = targetPath;
+  }
+}
+
+/**
+ * Refuse to write to live project state from a test context.
+ *
+ * Throws `LiveStateWriteViolation` when the resolved target path lands inside
+ * the live project's .gsd/ (GSD_PROJECT_ROOT) or any ~/.gsd/projects/<hash>/
+ * tree AND the current process looks like a test runner (NODE_TEST_CONTEXT,
+ * VITEST, etc.).
+ *
+ * Bypass via GSD_INTERNAL_ALLOW_LIVE_WRITE=1 for tests that legitimately
+ * exercise live project workspaces.
+ *
+ * @param targetPath The absolute path the caller is about to write to.
+ * @param operation A short label naming the operation (e.g. "appendOverride").
+ */
+export function assertSafeStateWrite(targetPath: string, operation: string): void {
+  if (process.env.GSD_INTERNAL_ALLOW_LIVE_WRITE === "1"
+    || process.env.GSD_INTERNAL_ALLOW_LIVE_WRITE === "true") {
+    return;
+  }
+  if (!isLikelyTestContext()) return;
+  if (!isUnderLiveProject(targetPath) && !isUnderGsdHomeProjects(targetPath)) return;
+
+  throw new LiveStateWriteViolation(
+    operation,
+    targetPath,
+    `${operation}: refusing to write to live project state from test context.\n` +
+    `  target: ${targetPath}\n` +
+    `  GSD_PROJECT_ROOT: ${process.env.GSD_PROJECT_ROOT ?? "(unset)"}\n` +
+    `  Tests must pass an isolated mkdtempSync basePath, not process.cwd or "/project". ` +
+    `Set GSD_INTERNAL_ALLOW_LIVE_WRITE=1 to bypass when intentionally exercising live state.`,
+  );
+}
+
 /**
  * Detect if a path is inside a .gsd/worktrees/<name>/ structure.
  *

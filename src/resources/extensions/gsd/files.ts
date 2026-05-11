@@ -6,7 +6,7 @@
 import { promises as fs } from 'node:fs';
 import { resolve } from 'node:path';
 import { atomicWriteAsync } from './atomic-write.js';
-import { resolveMilestoneFile, relMilestoneFile, resolveGsdRootFile } from './paths.js';
+import { resolveMilestoneFile, relMilestoneFile, resolveGsdRootFile, assertSafeStateWrite } from './paths.js';
 import { milestoneIdSort, findMilestoneIds } from './milestone-ids.js';
 
 import type {
@@ -797,6 +797,7 @@ export interface Override {
 
 export async function appendOverride(basePath: string, change: string, appliedAt: string): Promise<void> {
   const overridesPath = resolveGsdRootFile(basePath, "OVERRIDES");
+  assertSafeStateWrite(overridesPath, "appendOverride");
   const timestamp = new Date().toISOString();
   const entry = [
     `## Override: ${timestamp}`,

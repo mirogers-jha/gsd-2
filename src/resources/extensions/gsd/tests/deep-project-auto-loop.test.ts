@@ -780,6 +780,10 @@ test("deep project setup: new-project --deep uses cwd when nested inside a paren
 
 test("deep project setup: new-project asks interview stages in foreground", async () => {
   const base = makeBase();
+  // Unset GSD_PROJECT_ROOT (MEM032/MEM046) so emitUokAuditEvent does not
+  // resolve back to the live project state and trip assertSafeStateWrite.
+  const previousProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
   const previousWorkflowPath = process.env.GSD_WORKFLOW_PATH;
   process.env.GSD_WORKFLOW_PATH = join(base, "GSD-WORKFLOW.md");
   writeFileSync(process.env.GSD_WORKFLOW_PATH, "# Test Workflow\n");
@@ -851,6 +855,9 @@ test("deep project setup: new-project asks interview stages in foreground", asyn
       delete process.env.GSD_WORKFLOW_PATH;
     } else {
       process.env.GSD_WORKFLOW_PATH = previousWorkflowPath;
+    }
+    if (previousProjectRoot !== undefined) {
+      process.env.GSD_PROJECT_ROOT = previousProjectRoot;
     }
     rmSync(base, { recursive: true, force: true });
   }
@@ -927,6 +934,9 @@ test("deep auto dispatch forces milestone checkpoints into plain chat", async (t
 test("deep project setup: unrelated agent_end sessions do not advance pending setup", async () => {
   const base = makeBase();
   const otherBase = makeBase();
+  // Unset GSD_PROJECT_ROOT (MEM032/MEM046) so emitUokAuditEvent stays sandboxed.
+  const previousProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
   const previousWorkflowPath = process.env.GSD_WORKFLOW_PATH;
   process.env.GSD_WORKFLOW_PATH = join(base, "GSD-WORKFLOW.md");
   writeFileSync(process.env.GSD_WORKFLOW_PATH, "# Test Workflow\n");
@@ -968,6 +978,9 @@ test("deep project setup: unrelated agent_end sessions do not advance pending se
     } else {
       process.env.GSD_WORKFLOW_PATH = previousWorkflowPath;
     }
+    if (previousProjectRoot !== undefined) {
+      process.env.GSD_PROJECT_ROOT = previousProjectRoot;
+    }
     rmSync(base, { recursive: true, force: true });
     rmSync(otherBase, { recursive: true, force: true });
   }
@@ -975,6 +988,9 @@ test("deep project setup: unrelated agent_end sessions do not advance pending se
 
 test("deep project setup: same project advances when agent_end session id changes", async () => {
   const base = makeBase();
+  // Unset GSD_PROJECT_ROOT (MEM032/MEM046) so emitUokAuditEvent stays sandboxed.
+  const previousProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
   const previousWorkflowPath = process.env.GSD_WORKFLOW_PATH;
   process.env.GSD_WORKFLOW_PATH = join(base, "GSD-WORKFLOW.md");
   writeFileSync(process.env.GSD_WORKFLOW_PATH, "# Test Workflow\n");
@@ -1007,6 +1023,9 @@ test("deep project setup: same project advances when agent_end session id change
       delete process.env.GSD_WORKFLOW_PATH;
     } else {
       process.env.GSD_WORKFLOW_PATH = previousWorkflowPath;
+    }
+    if (previousProjectRoot !== undefined) {
+      process.env.GSD_PROJECT_ROOT = previousProjectRoot;
     }
     rmSync(base, { recursive: true, force: true });
   }
@@ -1250,6 +1269,9 @@ test("deep project setup: research-project supervision timeout is capped narrowl
 
 test("deep project setup: empty legacy pseudo-milestone dirs do not block first real milestone", async () => {
   const base = makeBase();
+  // Unset GSD_PROJECT_ROOT (MEM032/MEM046) so emitUokAuditEvent stays sandboxed.
+  const previousProjectRoot = process.env.GSD_PROJECT_ROOT;
+  delete process.env.GSD_PROJECT_ROOT;
   const previousWorkflowPath = process.env.GSD_WORKFLOW_PATH;
   const workflowPath = join(base, "GSD-WORKFLOW.md");
   try {
@@ -1287,6 +1309,9 @@ test("deep project setup: empty legacy pseudo-milestone dirs do not block first 
   } finally {
     if (previousWorkflowPath === undefined) delete process.env.GSD_WORKFLOW_PATH;
     else process.env.GSD_WORKFLOW_PATH = previousWorkflowPath;
+    if (previousProjectRoot !== undefined) {
+      process.env.GSD_PROJECT_ROOT = previousProjectRoot;
+    }
     clearPendingAutoStart(base);
     try {
       const { closeDatabase } = await import("../gsd-db.ts");
