@@ -463,7 +463,15 @@ export type WidgetMode = "full" | "small" | "min" | "off";
 const WIDGET_MODES: WidgetMode[] = ["full", "small", "min", "off"];
 let widgetMode: WidgetMode = "full";
 let widgetModeInitialized = false;
-let widgetModePreferencePath: string | null = null;
+// M002/S05/T01 — widgetModePreferencePath module-level cache REMOVED. Pre-fix
+// the cache was populated on first ensureWidgetModeLoaded() call against
+// whichever process.cwd() was active then, and never re-resolved on project
+// switch. With the cmux/multi-project workflow, this caused the FIRST
+// project's pref file to win — subsequent toggles in OTHER projects wrote
+// back to the wrong path. Post-fix every reader/writer below calls
+// resolveWidgetModePreferencePath() at every invocation, picking up the
+// current process.cwd() (or the active commands/context.ts cwd-override).
+// Pref reads are infrequent (UI toggle on demand); no perf concern.
 
 function safeReadTextFile(path: string): string | null {
   try {
@@ -502,7 +510,12 @@ function resolveWidgetModePreferencePath(
   return getGlobalGSDPreferencesPath();
 }
 
-/** Load widget mode from preferences (once). */
+/**
+ * Load widget mode from preferences (once per process — the in-memory
+ * widgetMode is sticky after first read). M002/S05/T01: dropped the
+ * widgetModePreferencePath cache; resolution happens fresh in every
+ * write site so cross-project pref leaks cannot occur.
+ */
 function ensureWidgetModeLoaded(projectPath?: string, globalPath?: string): void {
   if (widgetModeInitialized) return;
   widgetModeInitialized = true;
@@ -513,10 +526,8 @@ function ensureWidgetModeLoaded(projectPath?: string, globalPath?: string): void
     if (saved && WIDGET_MODES.includes(saved as WidgetMode)) {
       widgetMode = saved as WidgetMode;
     }
-    widgetModePreferencePath = resolveWidgetModePreferencePath(resolvedProjectPath, resolvedGlobalPath);
   } catch (err) { /* non-fatal — use default */
     logWarning("dashboard", `operation failed: ${getErrorMessage(err)}`);
-    widgetModePreferencePath = getGlobalGSDPreferencesPath();
   }
 }
 
@@ -528,7 +539,11 @@ function ensureWidgetModeLoaded(projectPath?: string, globalPath?: string): void
  */
 function persistWidgetMode(
   mode: WidgetMode,
-  prefsPath = widgetModePreferencePath ?? resolveWidgetModePreferencePath(),
+  // M002/S05/T01 — resolve fresh on every call (no module-level cache).
+  // Picks up the current process.cwd() / commands-context cwd-override
+  // so cross-project pref toggles write to the active project's pref
+  // file, not the first project ever loaded.
+  prefsPath = resolveWidgetModePreferencePath(),
 ): void {
   try {
     let content = "";
@@ -553,7 +568,8 @@ export function cycleWidgetMode(projectPath?: string, globalPath?: string): Widg
   ensureWidgetModeLoaded(projectPath, globalPath);
   const idx = WIDGET_MODES.indexOf(widgetMode);
   widgetMode = WIDGET_MODES[(idx + 1) % WIDGET_MODES.length];
-  persistWidgetMode(widgetMode, widgetModePreferencePath ?? resolveWidgetModePreferencePath(projectPath, globalPath));
+  // M002/S05/T01 — resolve fresh on every call (was widgetModePreferencePath cache).
+  persistWidgetMode(widgetMode, resolveWidgetModePreferencePath(projectPath, globalPath));
   return widgetMode;
 }
 
@@ -561,7 +577,8 @@ export function cycleWidgetMode(projectPath?: string, globalPath?: string): Widg
 export function setWidgetMode(mode: WidgetMode, projectPath?: string, globalPath?: string): void {
   ensureWidgetModeLoaded(projectPath, globalPath);
   widgetMode = mode;
-  persistWidgetMode(widgetMode, widgetModePreferencePath ?? resolveWidgetModePreferencePath(projectPath, globalPath));
+  // M002/S05/T01 — resolve fresh on every call (was widgetModePreferencePath cache).
+  persistWidgetMode(widgetMode, resolveWidgetModePreferencePath(projectPath, globalPath));
 }
 
 /** Get current widget mode. */
@@ -574,7 +591,7 @@ export function getWidgetMode(projectPath?: string, globalPath?: string): Widget
 export function _resetWidgetModeForTests(): void {
   widgetMode = "full";
   widgetModeInitialized = false;
-  widgetModePreferencePath = null;
+  // M002/S05/T01 — widgetModePreferencePath cache removed; nothing to reset.
 }
 
 // ─── Progress Widget ──────────────────────────────────────────────────────────
