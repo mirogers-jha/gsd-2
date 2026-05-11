@@ -16,6 +16,9 @@
  */
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AutoSession } from "../auto/session.ts";
 
 // ─── AutoSession.lastToolInvocationError field ───────────────────────────
@@ -102,17 +105,24 @@ describe("#2883: isToolInvocationError classification", () => {
   });
 
   test("detects raw write-gate CONTEXT failures for non-GSD write tools", () => {
-    resetWriteGateState(process.cwd());
-    const result = shouldBlockContextWrite(
-      "write",
-      "/tmp/project/.gsd/milestones/M001/M001-CONTEXT.md",
-      "M001",
-      false,
-    );
+    // Use a tmpdir so resetWriteGateState's snapshot persistence does not
+    // touch the project's real .gsd/runtime/write-gate-state.json.
+    const tmpBase = mkdtempSync(join(tmpdir(), "gsd-tool-invocation-error-"));
+    try {
+      resetWriteGateState(tmpBase);
+      const result = shouldBlockContextWrite(
+        "write",
+        "/tmp/project/.gsd/milestones/M001/M001-CONTEXT.md",
+        "M001",
+        false,
+      );
 
-    assert.equal(result.block, true);
-    assert.equal(isDeterministicPolicyError(result.reason ?? ""), true);
-    assert.equal(isToolInvocationError(result.reason ?? ""), true);
+      assert.equal(result.block, true);
+      assert.equal(isDeterministicPolicyError(result.reason ?? ""), true);
+      assert.equal(isToolInvocationError(result.reason ?? ""), true);
+    } finally {
+      rmSync(tmpBase, { recursive: true, force: true });
+    }
   });
 
   test("detects raw pending-gate failures for non-GSD write tools", () => {

@@ -32,15 +32,28 @@ import {
 import { DISPATCH_RULES, type DispatchContext } from '../auto-dispatch.ts';
 import { _setAutoActiveForTest } from '../auto.ts';
 
+// Per-test isolated basePath. Without this, every markDepthVerified /
+// clearDiscussionFlowState / loadWriteGateSnapshot call below would target
+// the project's real .gsd/runtime/write-gate-state.json, briefly polluting
+// (and on test crashes, persistently corrupting) the active project's M001
+// write-gate state during `npm test`.
+let testBasePath: string;
+
 // Reset all relevant state before and after each test.
 function resetState(): void {
   _setAutoActiveForTest(false);
-  clearDiscussionFlowState(process.cwd());
+  clearDiscussionFlowState(testBasePath);
 }
 
 describe('auto-discuss-milestone-deadlock-4973', () => {
-  beforeEach(resetState);
-  afterEach(resetState);
+  beforeEach(() => {
+    testBasePath = mkdtempSync(join(tmpdir(), 'gsd-4973-discuss-'));
+    resetState();
+  });
+  afterEach(() => {
+    resetState();
+    rmSync(testBasePath, { recursive: true, force: true });
+  });
 
   // ── Test 1 ──────────────────────────────────────────────────────────────
   // CONTEXT artifact save via gsd_summary_save is blocked before the mark
@@ -51,7 +64,7 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
     _setAutoActiveForTest(true);
 
     // Before mark: blocked
-    const snapshotBefore = loadWriteGateSnapshot(process.cwd());
+    const snapshotBefore = loadWriteGateSnapshot(testBasePath);
     const beforeResult = shouldBlockContextArtifactSaveInSnapshot(
       snapshotBefore,
       'CONTEXT',
@@ -61,10 +74,10 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
     assert.strictEqual(beforeResult.block, true, 'should block before markDepthVerified');
 
     // Simulate what the dispatch rule now does in auto-mode
-    markDepthVerified('M001', process.cwd());
+    markDepthVerified('M001', testBasePath);
 
     // After mark: unblocked
-    const snapshotAfter = loadWriteGateSnapshot(process.cwd());
+    const snapshotAfter = loadWriteGateSnapshot(testBasePath);
     const afterResult = shouldBlockContextArtifactSaveInSnapshot(
       snapshotAfter,
       'CONTEXT',
@@ -83,14 +96,14 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
     const contextPath = '.gsd/milestones/M001/M001-CONTEXT.md';
 
     // Before mark: blocked
-    const beforeResult = shouldBlockContextWrite('write', contextPath, 'M001');
+    const beforeResult = shouldBlockContextWrite('write', contextPath, 'M001', false, testBasePath);
     assert.strictEqual(beforeResult.block, true, 'write should be blocked before markDepthVerified');
 
     // Simulate dispatch rule auto-mark
-    markDepthVerified('M001', process.cwd());
+    markDepthVerified('M001', testBasePath);
 
     // After mark: unblocked
-    const afterResult = shouldBlockContextWrite('write', contextPath, 'M001');
+    const afterResult = shouldBlockContextWrite('write', contextPath, 'M001', false, testBasePath);
     assert.strictEqual(afterResult.block, false, 'write should not be blocked after markDepthVerified');
   });
 
@@ -109,8 +122,8 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
   // the dispatch-site call site is safe regardless of prior session state.
   test('Test 3: session_switch ordering — clearDiscussionFlowState clears mark; dispatch-site call re-establishes it', () => {
     // Simulate a mark from a prior session
-    markDepthVerified('M001', process.cwd());
-    let snapshot = loadWriteGateSnapshot(process.cwd());
+    markDepthVerified('M001', testBasePath);
+    let snapshot = loadWriteGateSnapshot(testBasePath);
     assert.strictEqual(
       isMilestoneDepthVerifiedInSnapshot(snapshot, 'M001'),
       true,
@@ -119,8 +132,8 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
 
     // session_switch fires clearDiscussionFlowState() — this is exactly what
     // register-hooks.ts:106 does
-    clearDiscussionFlowState(process.cwd());
-    snapshot = loadWriteGateSnapshot(process.cwd());
+    clearDiscussionFlowState(testBasePath);
+    snapshot = loadWriteGateSnapshot(testBasePath);
     assert.strictEqual(
       isMilestoneDepthVerifiedInSnapshot(snapshot, 'M001'),
       false,
@@ -130,9 +143,9 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
     // Now the dispatch rule fires (after session_switch cleared state)
     // and re-establishes the mark for the new session
     _setAutoActiveForTest(true);
-    markDepthVerified('M001', process.cwd()); // this is what the dispatch rule does
+    markDepthVerified('M001', testBasePath); // this is what the dispatch rule does
 
-    snapshot = loadWriteGateSnapshot(process.cwd());
+    snapshot = loadWriteGateSnapshot(testBasePath);
     assert.strictEqual(
       isMilestoneDepthVerifiedInSnapshot(snapshot, 'M001'),
       true,
@@ -158,7 +171,7 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
 
     // CONTEXT artifact save is still blocked
     const snapshotResult = shouldBlockContextArtifactSaveInSnapshot(
-      loadWriteGateSnapshot(process.cwd()),
+      loadWriteGateSnapshot(testBasePath),
       'CONTEXT',
       'M002',
       null,
@@ -174,6 +187,8 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
       'write',
       '.gsd/milestones/M002/M002-CONTEXT.md',
       'M002',
+      false,
+      testBasePath,
     );
     assert.strictEqual(
       writeResult.block,
@@ -238,7 +253,7 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
       );
 
       // ── Deep auto-mode case: the user-facing approval gate must stay closed ──
-      clearDiscussionFlowState(process.cwd());
+      clearDiscussionFlowState(testBasePath);
       if (existsSync(snapshotFile)) unlinkSync(snapshotFile);
       _setAutoActiveForTest(true);
       const deepCtx = {
@@ -262,9 +277,10 @@ describe('auto-discuss-milestone-deadlock-4973', () => {
       );
 
       // ── Interactive case: the rule must NOT call markDepthVerified ──
-      // clearDiscussionFlowState() only deletes the snapshot at process.cwd(),
-      // so we must explicitly remove the snapshot under our tempBase too.
-      clearDiscussionFlowState(process.cwd());
+      // clearDiscussionFlowState() only deletes the snapshot at the basePath
+      // it is called with, so we must explicitly remove the snapshot under
+      // our tempBase too.
+      clearDiscussionFlowState(testBasePath);
       if (existsSync(snapshotFile)) unlinkSync(snapshotFile);
       _setAutoActiveForTest(false);
       snap = loadWriteGateSnapshot(tempBase);
