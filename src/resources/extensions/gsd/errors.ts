@@ -15,6 +15,7 @@ export const GSD_GIT_ERROR = "GSD_GIT_ERROR";
 export const GSD_MERGE_CONFLICT = "GSD_MERGE_CONFLICT";
 export const GSD_PARSE_ERROR = "GSD_PARSE_ERROR";
 export const GSD_IO_ERROR = "GSD_IO_ERROR";
+export const GSD_RECONCILE_MAX_DEPTH = "GSD_RECONCILE_MAX_DEPTH";
 
 // ─── Base Error ───────────────────────────────────────────────────────────────
 

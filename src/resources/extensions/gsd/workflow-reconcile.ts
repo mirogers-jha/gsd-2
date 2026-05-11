@@ -25,6 +25,47 @@ import { clearParseCache } from "./files.js";
 import { writeManifest } from "./workflow-manifest.js";
 import { atomicWriteSync } from "./atomic-write.js";
 import { acquireSyncLock, releaseSyncLock } from "./sync-lock.js";
+import { GSDError, GSD_RECONCILE_MAX_DEPTH } from "./errors.js";
+
+// ─── Bounded-recursion test seam (D008, M003/S01 Bug 2) ──────────────────────
+//
+// `_reconcileWorktreeLogsInner` re-enters itself when a concurrent appendEvent
+// grows the event log between our initial read and the post-merge rewrite.
+// Without a cap, a sustained writer (or a buggy fixture) can spin the
+// reconciler indefinitely. We thread a `depth` counter and throw
+// `GSDError(GSD_RECONCILE_MAX_DEPTH, ...)` when the next retry would exceed
+// the cap. The cap is mutable via the test seam so a deterministic fixture
+// (cap=2 + a growing log) can drive the cap-exceed branch in milliseconds.
+//
+// The cap is per-public-call: `resolveConflict`'s re-entry into
+// `reconcileWorktreeLogs` restarts at depth 0.
+
+const _DEFAULT_RECONCILE_MAX_DEPTH = 8;
+let _activeReconcileMaxDepth = _DEFAULT_RECONCILE_MAX_DEPTH;
+
+export function _setReconcileMaxDepthForTests(n: number | null): void {
+  _activeReconcileMaxDepth = n ?? _DEFAULT_RECONCILE_MAX_DEPTH;
+}
+
+export function _resetReconcileMaxDepthForTests(): void {
+  _activeReconcileMaxDepth = _DEFAULT_RECONCILE_MAX_DEPTH;
+}
+
+// Between-reads hook (D008): synchronously called inside
+// `_reconcileWorktreeLogsInner` after `mainEvents = readEvents(...)` and
+// BEFORE the post-merge `preWriteEvents = readEvents(...)`. The bounded-
+// recursion test uses this to deterministically grow the event log on every
+// iteration so the `preWriteEvents.length > mainEvents.length` retry branch
+// trips repeatedly. Production callers never set this.
+let _activeReconcileBetweenReadsHook: (() => void) | null = null;
+
+export function _setReconcileBetweenReadsHookForTests(fn: (() => void) | null): void {
+  _activeReconcileBetweenReadsHook = fn;
+}
+
+export function _resetReconcileBetweenReadsHookForTests(): void {
+  _activeReconcileBetweenReadsHook = null;
+}
 
 // ─── Replay Helpers ──────────────────────────────────────────────────────────
 
@@ -440,6 +481,7 @@ export function reconcileWorktreeLogs(
 function _reconcileWorktreeLogsInner(
   mainBasePath: string,
   worktreeBasePath: string,
+  depth: number = 0,
 ): ReconcileResult {
   // Step 1: Read both logs
   const mainLogPath = join(mainBasePath, ".gsd", "event-log.jsonl");
@@ -479,10 +521,27 @@ function _reconcileWorktreeLogsInner(
   // Step 7: Write merged event log FIRST (so crash recovery can re-derive DB state)
   // Guard: detect concurrent appendEvent calls between our read (step 1) and
   // this rewrite. If the log grew, re-read and retry to avoid dropping events.
+  // Test seam: deterministic between-reads hook lets the bounded-recursion
+  // test grow the log on every retry to exercise the cap-exceed branch.
+  if (_activeReconcileBetweenReadsHook !== null) {
+    _activeReconcileBetweenReadsHook();
+  }
   const preWriteEvents = readEvents(mainLogPath);
   if (preWriteEvents.length > mainEvents.length) {
     logWarning("reconcile", `Event log grew during reconcile (${mainEvents.length} → ${preWriteEvents.length}), retrying with fresh read`);
-    return _reconcileWorktreeLogsInner(mainBasePath, worktreeBasePath);
+    // M003/S01 Bug 2: bound recursion via injected `_activeReconcileMaxDepth`
+    // seam (default 8). If the next call would exceed the cap, throw
+    // GSDError(GSD_RECONCILE_MAX_DEPTH) with attempts + sizeDelta encoded in
+    // the message (errors.ts has no structured `details` field).
+    if (depth >= _activeReconcileMaxDepth - 1) {
+      const attempts = depth + 1;
+      const sizeDelta = preWriteEvents.length - mainEvents.length;
+      throw new GSDError(
+        GSD_RECONCILE_MAX_DEPTH,
+        `reconcile retry cap exceeded after ${attempts} attempts (log grew ${mainEvents.length} → ${preWriteEvents.length}, sizeDelta=${sizeDelta})`,
+      );
+    }
+    return _reconcileWorktreeLogsInner(mainBasePath, worktreeBasePath, depth + 1);
   }
 
   const baseEvents = mainEvents.slice(0, forkPoint + 1);
